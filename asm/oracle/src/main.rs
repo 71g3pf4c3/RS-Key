@@ -1,8 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-use rsk_usb::ctaphid::{HID_RPT_SIZE, Outcome, Reassembler};
+use rsk_usb::ctaphid::{Outcome, Reassembler, TxFrames, HID_RPT_SIZE};
 use std::io::Read;
+
+const TX_CAP: usize = 7609; // CTAP_MAX_MESSAGE: 57 + 128*59
+
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in 0..b.len() / 2 {
+        let pair = std::str::from_utf8(&b[2 * i..2 * i + 2]).ok()?;
+        out.push(u8::from_str_radix(pair, 16).ok()?);
+    }
+    Some(out)
+}
 
 fn main() {
     let mut input = String::new();
@@ -15,6 +30,35 @@ fn main() {
         if l.is_empty() || l.starts_with('#') {
             continue;
         }
+
+        if let Some(rest) = l.strip_prefix("T ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            if parts.len() < 2 || parts[0].len() != 8 || parts[1].len() != 2 {
+                out.push_str("X parse\n");
+                continue;
+            }
+            let (cid, cmd, data) = (
+                u32::from_str_radix(parts[0], 16),
+                u8::from_str_radix(parts[1], 16),
+                parse_hex(parts.get(2).copied().unwrap_or("")),
+            );
+            let (cid, cmd, data) = match (cid, cmd, data) {
+                (Ok(c), Ok(m), Some(d)) if d.len() <= TX_CAP => (c, m, d),
+                _ => {
+                    out.push_str("X parse\n");
+                    continue;
+                }
+            };
+            for f in TxFrames::new(cid, cmd, &data) {
+                out.push_str("F ");
+                for b in f {
+                    out.push_str(&format!("{:02x}", b));
+                }
+                out.push('\n');
+            }
+            continue;
+        }
+
         let mut rpt = [0u8; HID_RPT_SIZE];
         let b = l.as_bytes();
         let mut ok = true;

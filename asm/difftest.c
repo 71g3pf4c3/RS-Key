@@ -3,8 +3,11 @@
 
 /* Differential harness: one 64-byte CTAPHID report per stdin line (128 hex
  * chars, '#' comments); feeds each to asm/ctaphid.S and prints the event
- * stream. The Rust oracle over rsk-usb's Reassembler prints the identical
- * format; the two outputs must be byte-identical. */
+ * stream. "T <cid> <cmd> <payload-hex>" lines instead drive asm/ctaphid_tx.S
+ * and print the resulting frame stream. The Rust oracle over rsk-usb's
+ * Reassembler / TxFrames prints the identical format; the two outputs must
+ * be byte-identical. Input is streamed line-by-line so no input size is
+ * silently truncated. */
 
 struct state {
     unsigned cid, cmd, bcnt, cur, seq, in_tx, buf_max;
@@ -12,15 +15,31 @@ struct state {
     unsigned ev_tag, ev_val, ev_cid, ev_cmd;
 };
 
+/* mirror of asm/ctaphid_tx.S's caller-owned state */
+struct tx_state {
+    unsigned cid, cmd;
+    const unsigned char *data;
+    unsigned len, off, seq, started;
+};
+
 #define MSG_CAP 7609 /* CTAP_MAX_MESSAGE: 57 + 128*59 */
 
 extern void ctaphid_feed(struct state *st, const unsigned char *rpt);
+extern void ctaphid_tx_init(struct tx_state *st, unsigned cid, unsigned cmd,
+                            const unsigned char *data, unsigned len);
+extern unsigned ctaphid_tx_next(struct tx_state *st, unsigned char *out);
 extern long sys_read(long fd, void *buf, long n);
 extern long sys_write(long fd, const void *buf, long n);
 
 static struct state st;
+static struct tx_state txs;
 static unsigned char msgbuf[MSG_CAP];
-static unsigned char inbuf[16 << 20];
+static unsigned char paybuf[MSG_CAP];
+static unsigned char tframe[64];
+
+/* any real line fits with two orders of magnitude to spare: the longest is
+ * a maximum-size T payload at ~15.3 KB */
+static unsigned char inbuf[1 << 20];
 
 /* CTAPHID framing offsets, mirroring asm/ctaphid.S. */
 #define RPT_CMD     0
@@ -81,69 +100,131 @@ static void emit(const unsigned char *p, unsigned len)
     sys_write(1, p, len);
 }
 
+static void process_line(unsigned char *p, unsigned char *eol)
+{
+    unsigned char rpt[64];
+    unsigned char out[2 * MSG_CAP + 64];
+
+    while (p < eol && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+    /* mirror the oracle's trim(): trailing whitespace too, so \r\n and
+     * padded lines parse identically on both sides */
+    while (eol > p && (eol[-1] == ' ' || eol[-1] == '\t' || eol[-1] == '\r')) eol--;
+    if (p >= eol || *p == '#') return;
+
+    if (*p == 'T' && p + 1 < eol && *(p + 1) == ' ') {
+        p += 2;
+        unsigned cid = 0, cmd = 0, plen = 0;
+        int ok = 1;
+        for (int i = 0; i < 8 && ok; i++) {
+            int v = (p < eol) ? hexval(*p++) : -1;
+            if (v < 0) ok = 0; else cid = (cid << 4) | v;
+        }
+        if (ok && p < eol && *p == ' ') p++; else ok = 0;
+        for (int i = 0; i < 2 && ok; i++) {
+            int v = (p < eol) ? hexval(*p++) : -1;
+            if (v < 0) ok = 0; else cmd = (cmd << 4) | v;
+        }
+        if (ok && p == eol) {
+            /* empty payload: the bare INIT */
+        } else if (ok && p < eol && *p == ' ') {
+            p++;
+            while (p < eol) {
+                int hi = hexval(*p++);
+                int lo = (p < eol) ? hexval(*p++) : -1;
+                if (hi < 0 || lo < 0 || plen >= MSG_CAP) { ok = 0; break; }
+                paybuf[plen++] = (unsigned char)((hi << 4) | lo);
+            }
+        } else {
+            ok = 0;
+        }
+        if (!ok) {
+            emit((const unsigned char *)"X parse\n", 8);
+            return;
+        }
+        ctaphid_tx_init(&txs, cid, cmd, paybuf, plen);
+        unsigned n = 0;
+        while (n < 256 && ctaphid_tx_next(&txs, tframe)) {
+            unsigned char *o = out;
+            *o++ = 'F'; *o++ = ' ';
+            o = hexn(o, tframe, 64);
+            *o++ = '\n';
+            emit(out, o - out);
+            n++;
+        }
+        if (n == 256) emit((const unsigned char *)"X runaway\n", 10);
+        return;
+    }
+
+    for (int i = 0; i < 64; i++) rpt[i] = 0;
+    int ok = 1;
+    for (int i = 0; i < 64; i++) {
+        int hi = hexval(*p++);
+        int lo = (p < eol) ? hexval(*p++) : -1;
+        if (hi < 0 || lo < 0) { ok = 0; break; }
+        rpt[i] = (unsigned char)((hi << 4) | lo);
+    }
+    if (!ok) {
+        emit((const unsigned char *)"X parse\n", 8);
+        return;
+    }
+
+    ctaphid_feed(&st, rpt);
+    unsigned tag = st.ev_tag, val = st.ev_val;
+    unsigned char *o = out;
+    switch (tag) {
+    case 0:
+        *o++ = 'B'; *o++ = '\n';
+        break;
+    case 1:
+        *o++ = 'D'; *o++ = ' ';
+        o = hex8(o, st.ev_cid); *o++ = ' ';
+        o = hex2(o, st.ev_cmd); *o++ = ' ';
+        o = hexp(o, val); *o++ = ' ';
+        o = hexn(o, msgbuf, val); *o++ = '\n';
+        break;
+    case 2:
+        *o++ = 'E'; *o++ = ' ';
+        o = hex8(o, st.ev_cid); *o++ = ' ';
+        o = hex2(o, val); *o++ = '\n';
+        break;
+    default:
+        *o++ = 'I'; *o++ = '\n';
+        break;
+    }
+    emit(out, o - out);
+}
+
 int harness_main(void)
 {
     st.buf_max = MSG_CAP;
     st.buf = msgbuf;
 
-    long total = 0;
+    unsigned have = 0;
     for (;;) {
-        long n = sys_read(0, inbuf + total, sizeof inbuf - total);
+        long n = sys_read(0, inbuf + have, sizeof inbuf - have);
         if (n <= 0) break;
-        total += n;
-        if ((unsigned long)total >= sizeof inbuf) break;
-    }
+        have += (unsigned)n;
 
-    unsigned char rpt[64];
-    unsigned char out[2 * MSG_CAP + 64];
-    unsigned char *line = inbuf;
-    unsigned char *end = inbuf + total;
-
-    while (line < end) {
-        unsigned char *eol = line;
-        while (eol < end && *eol != '\n') eol++;
-        unsigned char *p = line;
-        line = (eol < end) ? eol + 1 : end;
-        while (p < eol && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
-        if (p >= eol || *p == '#') continue;
-
-        for (int i = 0; i < 64; i++) rpt[i] = 0;
-        int ok = 1;
-        for (int i = 0; i < 64; i++) {
-            int hi = hexval(*p++);
-            int lo = (p < eol) ? hexval(*p++) : -1;
-            if (hi < 0 || lo < 0) { ok = 0; break; }
-            rpt[i] = (unsigned char)((hi << 4) | lo);
+        unsigned char *line = inbuf;
+        unsigned char *end = inbuf + have;
+        while (line < end) {
+            unsigned char *eol = line;
+            while (eol < end && *eol != '\n') eol++;
+            if (eol == end) break;
+            process_line(line, eol);
+            line = eol + 1;
         }
-        if (!ok) {
-            emit((const unsigned char *)"X parse\n", 8);
+        if (line == inbuf) {
+            if (have == sizeof inbuf) {
+                /* a line with no room to exist: drop it, keep streaming */
+                emit((const unsigned char *)"X parse\n", 8);
+                have = 0;
+            }
             continue;
         }
-
-        ctaphid_feed(&st, rpt);
-        unsigned tag = st.ev_tag, val = st.ev_val;
-        unsigned char *o = out;
-        switch (tag) {
-        case 0:
-            *o++ = 'B'; *o++ = '\n';
-            break;
-        case 1:
-            *o++ = 'D'; *o++ = ' ';
-            o = hex8(o, st.ev_cid); *o++ = ' ';
-            o = hex2(o, st.ev_cmd); *o++ = ' ';
-            o = hexp(o, val); *o++ = ' ';
-            o = hexn(o, msgbuf, val); *o++ = '\n';
-            break;
-        case 2:
-            *o++ = 'E'; *o++ = ' ';
-            o = hex8(o, st.ev_cid); *o++ = ' ';
-            o = hex2(o, val); *o++ = '\n';
-            break;
-        default:
-            *o++ = 'I'; *o++ = '\n';
-            break;
-        }
-        emit(out, o - out);
+        have = end - line;
+        for (unsigned i = 0; i < have; i++) inbuf[i] = line[i];
     }
+    if (have > 0) process_line(inbuf, inbuf + have);
     return 0;
 }

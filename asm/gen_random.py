@@ -6,10 +6,12 @@
 usage: gen_random.py SEED N [noise|mixed]
 
 noise: every frame is uniform garbage around the framing (wrong cids, seqs,
-       bcnts past the cap, broadcast, cid zero).
+        bcnts past the cap, broadcast, cid zero).
 mixed: valid transactions with random lengths (including empty, exact-fit and
-       full 7609) with noise frames interleaved mid-transaction — restarts,
-       cross-channel injections and gaps land on live state.
+        full 7609) with noise frames interleaved mid-transaction — restarts,
+        cross-channel injections and gaps land on live state.
+tx:    "T cid cmd payload" lines — response framing with random lengths,
+        cmds with and without the INIT bit, and edge cids.
 """
 
 import random
@@ -61,6 +63,17 @@ def noise_frame(rng):
     return bytes(b)
 
 
+def tx_line(rng):
+    cid = rng.choice(CIDS)
+    cmd = rng.choice(
+        [0x83, 0x86, 0xBB, 0xBF, 0x80 | rng.randrange(8), rng.randrange(0x80)]
+    )
+    ln = rng.choice(
+        [0, 1, 56, 57, 58, 59, 116, 117, rng.randrange(1, 2000), rng.randrange(2000, 7610)]
+    )
+    return "T {:08x} {:02x} {}".format(cid, cmd, pat(rng, ln).hex())
+
+
 def main():
     seed = int(sys.argv[1])
     n = int(sys.argv[2])
@@ -68,6 +81,11 @@ def main():
     rng = random.Random(seed)
 
     out = []
+    if mode == "tx":
+        for _ in range(n):
+            out.append(tx_line(rng))
+        print("\n".join(out))
+        return
     tx = None  # live valid transaction: (cid, payload, off, seq)
     for _ in range(n):
         if mode == "mixed":

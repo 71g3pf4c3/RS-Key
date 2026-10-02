@@ -90,4 +90,38 @@ case("broadcast MSG rejected", [init(BROADCAST, 3, pat(5))])
 case("broadcast CONT rejected", [cont(BROADCAST, 0, pat(59))])
 case("broadcast INIT command accepted", [init(BROADCAST, CTAPHID_INIT & 0x7F, b"")])
 
+# TX framing: "T <cid> <cmd> <payload-hex>" lines; both sides split the
+# response and must emit identical F-frames.
+
+
+def tcase(name, cid, cmd, payload):
+    frames.append("# " + name)
+    frames.append("T {:08x} {:02x} {}".format(cid, cmd & 0xFF, payload.hex()))
+
+
+tcase("tx: empty message is a bare INIT", CID, 0x86, b"")
+tcase("tx: single byte", CID, 0x83, pat(1))
+tcase("tx: exact INIT fill (57)", CID, 0x83, pat(57))
+tcase("tx: one byte into a CONT (58)", CID, 0x83, pat(58))
+tcase("tx: exact two-frame fill (116)", CID, 0x83, pat(116))
+tcase("tx: 117", CID, 0x83, pat(117))
+tcase("tx: keepalive is a one-byte response", CID, 0xBB, b"\x01")
+tcase("tx: error frame shape", CID, 0xBF, b"\x2c")
+tcase("tx: cmd passes through verbatim (no bit forcing)", CID, 0x03, pat(5))
+tcase("tx: maximum message (7609)", CID, 0x83, pat(MSG_CAP))
+tcase("tx: one short of the maximum (7608)", CID, 0x83, pat(MSG_CAP - 1))
+tcase("tx: broadcast cid passthrough", BROADCAST, 0x86, pat(100))
+tcase("tx: cid zero passthrough", 0, 0x83, pat(100))
+tcase("tx: cid one", 1, 0x83, pat(60))
+
+# Harness parse-parity: trailing whitespace and CRLF must trim identically
+# on both sides of the differential (the C harness mirrors the oracle's
+# trim() in both directions).
+frames.append("# tx: trailing spaces after the payload hex")
+frames.append("T {:08x} {:02x} {}  ".format(CID, 0x83, pat(5).hex()))
+frames.append("# frame line with a trailing \\r (CRLF input)")
+frames.append(init(CID, 3, pat(5)).hex() + "\r")
+frames.append("# frame line with trailing spaces")
+frames.append(init(CID2, 3, pat(57)).hex() + "  ")
+
 print("\n".join(frames))
