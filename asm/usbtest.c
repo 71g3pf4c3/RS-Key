@@ -48,13 +48,21 @@
 #define CS_IN_TX 5
 #define CS_EV_TAG 8
 #define CS_EV_VAL 9
+#define CS_EV_CID 10
+#define CS_EV_CMD 11
 #define EV_DONE 1
 #define EV_ERROR 2
 #define ERR_INVALID_SEQ 4
 
+/* tx state (asm/ctaphid_tx.S layout) */
+#define CTAPHID_TX_STATE 28
+
 extern void usb_init(void);
 extern void usb_task(void);
 extern void usb_send_ep1(const unsigned char *buf, unsigned len);
+extern void ctaphid_tx_init(unsigned *state, unsigned cid, unsigned char cmd,
+                            const unsigned char *data, unsigned len);
+extern unsigned ctaphid_tx_next(unsigned *state, unsigned char *out);
 extern unsigned usb_state[5];       /* pending, configured, out_pid, in_pid, tx_done */
 extern unsigned ctaphid_state[12];
 extern unsigned char ctaphid_msg[7609];
@@ -180,6 +188,21 @@ static void ctaphid_packet(unsigned char *p, unsigned cid, int is_init,
     int n = bcnt < cap ? bcnt : cap;
     if (n > dlen) n = dlen;
     for (int i = 0; i < n; i++) p[off + i] = data[i];
+}
+
+/* the responder's IN read after the driver sent one frame: the model
+ * auto-completes on the next cycle; compare the EP1 IN DPRAM against
+ * the frame the TX kernel produced */
+static int send_and_read_ep1_in(const unsigned char *frame)
+{
+    usb_state[4] = 0;                   /* consume the prior completion */
+    usb_send_ep1(frame, 64);
+    pump(2);
+    if (usb_state[4] != 1) return 0;
+    int ok = 1;
+    for (int i = 0; i < 64; i++)
+        if (EP1_IN_BUF(i) != frame[i]) ok = 0;
+    return ok;
 }
 
 int harness_main(void)
@@ -416,6 +439,94 @@ int harness_main(void)
     usb_send_ep1(payload, 16);
     CHECK(!(BC1_IN & BC_DATA1), "post-reset ep1 in DATA0");
     pump(2);
+
+    /* ---- E2E: host -> EP1 OUT -> ctaphid_feed -> done -> harness
+     * echoes via ctaphid_tx + usb_send_ep1 -> model host reads EP1 IN ---- */
+    unsigned char txst[CTAPHID_TX_STATE];
+    unsigned char frame[64];
+    unsigned char data400[400];
+    for (int i = 0; i < 400; i++) data400[i] = (unsigned char)(i * 3 + 11);
+    unsigned char req32[32];
+    for (int i = 0; i < 32; i++) req32[i] = (unsigned char)(i + 100);
+
+    /* (a) single-frame response: host request payload 32b, response 32b
+     * (fits in one INIT, seq path = INIT only). The wire INIT byte is
+     * cmd|0x80 (CTAP2 §11.2.9.2); the response cmd reuses it, bit 7
+     * already set — 0x83 here */
+    ctaphid_packet(pkt, 0x5EED5EEDu, 1, 0x83, 32, req32, 32);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "e2e single request done");
+    CHECK((unsigned)ctaphid_state[CS_EV_CMD] == (unsigned)0x83u, "e2e single cmd echo");
+    ctaphid_tx_init((unsigned*)txst, 0x5EED5EEDu, 0x83, req32, 32);
+    CHECK(ctaphid_tx_next((unsigned*)txst, frame) == 1, "e2e single tx frame 1");
+    CHECK(!(BC1_IN & BC_DATA1), "e2e single in DATA0 (post-reset pid)");
+    CHECK(send_and_read_ep1_in(frame), "e2e single dpram == tx frame");
+    CHECK(ctaphid_tx_next((unsigned*)txst, frame) == 0, "e2e single tx exhausted");
+
+    /* (b) 100-byte response crosses 57/59: INIT + 1 CONT (seq 0) */
+    ctaphid_packet(pkt, 0x5EED5EEDu, 1, 0x84, 40, data400, 40);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "e2e mid request done");
+    ctaphid_tx_init((unsigned*)txst, 0x5EED5EEDu, 0x84, data400, 100);
+    CHECK(ctaphid_tx_next((unsigned*)txst, frame) == 1, "e2e multi tx init");
+    CHECK(send_and_read_ep1_in(frame), "e2e multi dpram == tx init");
+    CHECK(usb_state[3] == 1, "e2e multi pid toggled toward DATA1");
+    CHECK(ctaphid_tx_next((unsigned*)txst, frame) == 1, "e2e multi tx cont");
+    CHECK(send_and_read_ep1_in(frame), "e2e multi dpram == tx cont");
+    CHECK(usb_state[3] == 0, "e2e multi pid back to DATA0 after 2 frames");
+    CHECK(ctaphid_tx_next((unsigned*)txst, frame) == 0, "e2e multi tx exhausted");
+
+    /* (c) 400-byte response: INIT + CONT seq 0..5, 6 CONT frames
+     * (INIT 57 + 5*59 = 352, tail 48 in CONT5) */
+    ctaphid_packet(pkt, 0x5EED5EEDu, 1, 0x85, 20, data400, 20);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "e2e large request done");
+    /* INIT 57 + 5 contiguous runs of 59 (293..352) + 48 tail = 7 frames */
+    ctaphid_tx_init((unsigned*)txst, 0x5EED5EEDu, 0x85, data400, 400);
+    int nframes = 0;
+    while (ctaphid_tx_next((unsigned*)txst, frame) == 1) {
+        CHECK(send_and_read_ep1_in(frame), "e2e large dpram == tx frame");
+        nframes++;
+    }
+    CHECK(nframes == 7, "e2e large frame count 7");
+
+    /* (d) IN data toggle alternated through the whole exchange above:
+     * odd IN completion since the SET_CONFIGURATION just before the
+     * section, so the next frame must go out on DATA1 */
+    CHECK(usb_state[3] == 1, "e2e toggle odd count leaves pid DATA1");
+    usb_send_ep1(frame, 64);
+    CHECK(BC1_IN & BC_DATA1, "e2e toggle next in DATA1");
+    CHECK(send_and_read_ep1_in(frame), "e2e toggle dpram == tx frame");
+    CHECK(usb_state[3] == 0, "e2e toggle flipped back to DATA0");
+    inject((const unsigned char[]){0x00, 0x09, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00});
+    pump(5);
+    CHECK(usb_state[3] == 0 && usb_state[2] == 0, "e2e set_config resets both pids");
+    CHECK(!(BC1_OUT & BC_DATA1), "e2e set_config re-arms out DATA0");
+
+    /* (e) interleaving: a second host->device message after the response
+     * completes exercises reassembler state reset; the echo must still
+     * match byte-for-byte */
+    unsigned char data200[200];
+    for (int i = 0; i < 200; i++) data200[i] = (unsigned char)(i * 5 + 77);
+    ctaphid_packet(pkt, 0x0BAD5EEDu, 1, 0x86, 12, data200, 12);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "e2e interleave request done");
+    CHECK((unsigned)ctaphid_state[CS_EV_CMD] == (unsigned)0x86u, "e2e interleave cmd echo");
+    CHECK(ctaphid_state[CS_CUR] == 12, "e2e interleave length");
+    CHECK(msg_matches(data200, 12), "e2e interleave bytes");
+    ctaphid_tx_init((unsigned*)txst, 0x0BAD5EEDu, 0x86, data200, 150);
+    nframes = 0;
+    while (ctaphid_tx_next((unsigned*)txst, frame) == 1) {
+        CHECK(send_and_read_ep1_in(frame), "e2e interleave dpram == tx frame");
+        nframes++;
+    }
+    CHECK(nframes == 3, "e2e interleave frame count 3");
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "e2e interleave rx still settled");
+    CHECK(ctaphid_state[CS_CID] == 0x0BAD5EEDu, "e2e interleave rx cid holds new channel");
 
     say(fails ? "USB MODEL TESTS: FAILED\n" : "USB MODEL TESTS: PASSED\n");
     return fails;
