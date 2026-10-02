@@ -124,4 +124,25 @@ frames.append(init(CID, 3, pat(5)).hex() + "\r")
 frames.append("# frame line with trailing spaces")
 frames.append(init(CID2, 3, pat(57)).hex() + "  ")
 
+# INIT allocation: "I <can_wink> <nonce-hex>" lines; both sides allocate a
+# persistent next_cid from FIRST_CID and compose, then broadcast-frame the
+# 17-byte reply (nonce||newcid LE||iface 2||major||minor||build||caps).
+
+
+def icase(name, can_wink, nonce):
+    frames.append("# " + name)
+    frames.append("I {} {}".format(can_wink, nonce.hex()))
+
+
+icase("init: broadcast reply, can_wink off", 0, b"\x01\x02\x03\x04\x05\x06\x07\x08")
+icase("init: broadcast reply, can_wink on", 1, bytes(range(8)))
+icase("init: cid sequence step 1", 0, b"\x00" * 8)
+icase("init: cid sequence step 2", 0, b"\x00" * 8)
+icase("init: cid sequence step 3", 0, b"\x00" * 8)
+icase("init: nonce all-zero", 1, b"\x00" * 8)
+icase("init: nonce all-ff", 0, b"\xff" * 8)
+icase("init: nonce mixed", 1, bytes([0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33]))
+frames.append("# init: odd nonce length X-parses identically")
+frames.append("I 0 deadbeef")
+
 print("\n".join(frames))

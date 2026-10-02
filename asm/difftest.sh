@@ -25,10 +25,11 @@ command -v "$QEMU_BIN" >/dev/null || { echo "qemu-arm not found; set QEMU=" >&2;
 CFLAGS="-mcpu=cortex-m33 -mthumb -mfloat-abi=soft -ffreestanding -fno-builtin -nostdlib"
 arm-none-eabi-gcc $CFLAGS -c ctaphid.S -o "$OUT/ctaphid.o"
 arm-none-eabi-gcc $CFLAGS -c ctaphid_tx.S -o "$OUT/ctaphid-tx.o"
+arm-none-eabi-gcc $CFLAGS -c ctaphid_init.S -o "$OUT/ctaphid-init.o"
 arm-none-eabi-gcc $CFLAGS -c difftest.S -o "$OUT/difftest-s.o"
 arm-none-eabi-gcc $CFLAGS -Os -c difftest.c -o "$OUT/difftest-c.o"
 arm-none-eabi-gcc -nostdlib -static -Wl,--build-id=none -e _start \
-    -o "$OUT/difftest.elf" "$OUT/ctaphid.o" "$OUT/ctaphid-tx.o" "$OUT/difftest-s.o" "$OUT/difftest-c.o"
+    -o "$OUT/difftest.elf" "$OUT/ctaphid.o" "$OUT/ctaphid-tx.o" "$OUT/ctaphid-init.o" "$OUT/difftest-s.o" "$OUT/difftest-c.o"
 arm-none-eabi-objdump -d "$OUT/difftest.elf" > "$OUT/difftest.disasm"
 arm-none-eabi-size "$OUT/difftest.elf"
 

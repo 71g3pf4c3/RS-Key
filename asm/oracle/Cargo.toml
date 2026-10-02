@@ -20,3 +20,4 @@ publish = false
 
 [dependencies]
 rsk-usb = { path = "../../crates/rsk-usb" }
+rsk-sdk = { path = "../../crates/rsk-sdk" }

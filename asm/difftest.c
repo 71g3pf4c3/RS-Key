@@ -22,17 +22,27 @@ struct tx_state {
     unsigned len, off, seq, started;
 };
 
+/* mirror of asm/ctaphid_init.S's caller-owned state */
+struct init_state {
+    unsigned next_cid;
+};
+
 #define MSG_CAP 7609 /* CTAP_MAX_MESSAGE: 57 + 128*59 */
 
 extern void ctaphid_feed(struct state *st, const unsigned char *rpt);
 extern void ctaphid_tx_init(struct tx_state *st, unsigned cid, unsigned cmd,
                             const unsigned char *data, unsigned len);
 extern unsigned ctaphid_tx_next(struct tx_state *st, unsigned char *out);
+extern void ctaphid_init_init(struct init_state *st);
+extern unsigned ctaphid_init_run(struct init_state *st,
+                                 const unsigned char *nonce, unsigned nonce_len,
+                                 unsigned can_wink, unsigned char *out17);
 extern long sys_read(long fd, void *buf, long n);
 extern long sys_write(long fd, const void *buf, long n);
 
 static struct state st;
 static struct tx_state txs;
+static struct init_state inis;
 static unsigned char msgbuf[MSG_CAP];
 static unsigned char paybuf[MSG_CAP];
 static unsigned char tframe[64];
@@ -155,6 +165,42 @@ static void process_line(unsigned char *p, unsigned char *eol)
         return;
     }
 
+    if (*p == 'I' && p + 1 < eol && *(p + 1) == ' ') {
+        p += 2;
+        int can_wink, ok = 1;
+        if (p < eol && (*p == '0' || *p == '1')) {
+            can_wink = (*p == '1');
+            p++;
+        } else {
+            ok = 0;
+        }
+        if (ok && p < eol && *p == ' ') p++; else ok = 0;
+        unsigned char nonce[8];
+        for (int i = 0; i < 8 && ok; i++) {
+            int hi = (p < eol) ? hexval(*p++) : -1;
+            int lo = (p < eol) ? hexval(*p++) : -1;
+            if (hi < 0 || lo < 0) ok = 0; else nonce[i] = (unsigned char)((hi << 4) | lo);
+        }
+        if (ok && p != eol) ok = 0; /* nonce must be exactly 8 bytes */
+        if (!ok) {
+            emit((const unsigned char *)"X parse\n", 8);
+            return;
+        }
+        unsigned char out17[17];
+        ctaphid_init_run(&inis, nonce, 8, can_wink, out17);
+        ctaphid_tx_init(&txs, 0xffffffffu, 0x86, out17, 17);
+        unsigned n = 0;
+        while (n < 256 && ctaphid_tx_next(&txs, tframe)) {
+            unsigned char *o = out;
+            *o++ = 'F'; *o++ = ' ';
+            o = hexn(o, tframe, 64);
+            *o++ = '\n';
+            emit(out, o - out);
+            n++;
+        }
+        return;
+    }
+
     for (int i = 0; i < 64; i++) rpt[i] = 0;
     int ok = 1;
     for (int i = 0; i < 64; i++) {
@@ -198,6 +244,7 @@ int harness_main(void)
 {
     st.buf_max = MSG_CAP;
     st.buf = msgbuf;
+    ctaphid_init_init(&inis);
 
     unsigned have = 0;
     for (;;) {

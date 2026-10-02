@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
-use rsk_usb::ctaphid::{Outcome, Reassembler, TxFrames, HID_RPT_SIZE};
+use rsk_usb::ctaphid::{
+    init_capabilities, CidAllocator, Outcome, Reassembler, TxFrames, CTAPHID_IF_VERSION,
+    HID_RPT_SIZE,
+};
 use std::io::Read;
 
 const TX_CAP: usize = 7609; // CTAP_MAX_MESSAGE: 57 + 128*59
+const CID_BROADCAST: u32 = 0xFFFF_FFFF;
+const INIT_CMD: u8 = 0x86;
 
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
@@ -23,6 +28,7 @@ fn main() {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap();
     let mut re = Reassembler::new();
+    let mut allocator = CidAllocator::new();
     let mut out = String::new();
 
     for line in input.lines() {
@@ -50,6 +56,39 @@ fn main() {
                 }
             };
             for f in TxFrames::new(cid, cmd, &data) {
+                out.push_str("F ");
+                for b in f {
+                    out.push_str(&format!("{:02x}", b));
+                }
+                out.push('\n');
+            }
+            continue;
+        }
+
+        if let Some(rest) = l.strip_prefix("I ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            let (can_wink, nonce) = match parts.as_slice() {
+                [w, h] if (*w == "0" || *w == "1") && h.len() == 16 => match parse_hex(h) {
+                    Some(b) if b.len() == 8 => (*w == "1", b),
+                    _ => {
+                        out.push_str("X parse\n");
+                        continue;
+                    }
+                },
+                _ => {
+                    out.push_str("X parse\n");
+                    continue;
+                }
+            };
+            let cid = allocator.allocate();
+            let mut payload = nonce;
+            payload.extend_from_slice(&cid.to_le_bytes());
+            payload.push(CTAPHID_IF_VERSION);
+            let (maj, min, bld) = rsk_sdk::FIRMWARE_VERSION;
+            payload.extend_from_slice(&[maj, min, bld]);
+            payload.push(init_capabilities(can_wink));
+            assert_eq!(payload.len(), 17);
+            for f in TxFrames::new(CID_BROADCAST, INIT_CMD, &payload) {
                 out.push_str("F ");
                 for b in f {
                     out.push_str(&format!("{:02x}", b));

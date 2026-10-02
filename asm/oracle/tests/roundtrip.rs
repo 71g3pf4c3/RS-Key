@@ -246,3 +246,33 @@ fn tx_random_soak() {
         assert_eq!((r_cid, r_cmd, r_data), (cid, cmd, data), "iter {it}");
     }
 }
+
+/// The INIT reply body is glued positionally (nonce||cid LE||iface||maj||min||
+/// build||caps) — there is no pub builder in shipping code, so this test pins
+/// the layout the assembly kernel and the oracle must both reproduce.
+#[test]
+fn init_payload_layout() {
+    use rsk_usb::ctaphid::{init_capabilities, CidAllocator, CTAPHID_IF_VERSION};
+
+    let nonce = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+    let mut alloc = CidAllocator::new();
+    let cid = alloc.allocate();
+    let can_wink = true;
+
+    let mut payload = nonce.to_vec();
+    payload.extend_from_slice(&cid.to_le_bytes());
+    payload.push(CTAPHID_IF_VERSION);
+    let (maj, min, bld) = rsk_sdk::FIRMWARE_VERSION;
+    payload.extend_from_slice(&[maj, min, bld]);
+    payload.push(init_capabilities(can_wink));
+
+    assert_eq!(payload.len(), 17);
+    assert_eq!(&payload[0..8], &nonce);
+    assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), cid);
+    assert_eq!(payload[12], CTAPHID_IF_VERSION);
+    assert_eq!(
+        (payload[13], payload[14], payload[15]),
+        rsk_sdk::FIRMWARE_VERSION
+    );
+    assert_eq!(payload[16], init_capabilities(can_wink));
+}

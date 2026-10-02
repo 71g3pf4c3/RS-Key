@@ -11,7 +11,9 @@ mixed: valid transactions with random lengths (including empty, exact-fit and
         full 7609) with noise frames interleaved mid-transaction — restarts,
         cross-channel injections and gaps land on live state.
 tx:    "T cid cmd payload" lines — response framing with random lengths,
-        cmds with and without the INIT bit, and edge cids.
+        cmds with and without the INIT bit, and edge cids; roughly every
+        third line is instead an "I can_wink nonce-hex" INIT allocation
+        demand, so the differential also fuzzes the reply composition.
 """
 
 import random
@@ -83,7 +85,10 @@ def main():
     out = []
     if mode == "tx":
         for _ in range(n):
-            out.append(tx_line(rng))
+            if rng.randrange(3) == 0:
+                out.append("I {} {}".format(rng.choice(["0", "1"]), pat(rng, 8).hex()))
+            else:
+                out.append(tx_line(rng))
         print("\n".join(out))
         return
     tx = None  # live valid transaction: (cid, payload, off, seq)
