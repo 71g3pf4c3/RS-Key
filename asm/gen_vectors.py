@@ -145,4 +145,121 @@ icase("init: nonce mixed", 1, bytes([0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0
 frames.append("# init: odd nonce length X-parses identically")
 frames.append("I 0 deadbeef")
 
+# Transport control: keepalive / cancel / channel lock. "K <is_cbor> <up_pending>"
+# -> "S 00|01|02"; "C <128-hex frame> <n dec> <cid 8-hex>" -> "C 0|1";
+# "L arm <cid 8-hex> <secs dec> <now_ms dec>" persists the lock (no output);
+# "L refuse <cid 8-hex> <cmd 2-hex> <now_ms dec>" -> "R 0|1".
+
+LOWN = 0x11223344
+LOTH = 0x01000001
+
+
+def kcase(name, is_cbor, up):
+    frames.append("# keepalive: " + name)
+    frames.append("K {} {}".format(is_cbor, up))
+
+
+kcase("u2f fast op stays silent", 0, 0)      # None
+kcase("u2f touch wait", 0, 1)                # UPNEEDED
+kcase("cbor slow op", 1, 0)                  # PROCESSING
+kcase("cbor touch wait", 1, 1)               # UPNEEDED (touch wins)
+
+
+def cframe(cid, cmd):
+    b = bytearray(64)
+    b[0:4] = struct.pack("<I", cid)
+    b[4] = cmd
+    return bytes(b)
+
+
+def ccase(name, cid, cmd, n, want):
+    frames.append("# cancel: {0} -> C {1}".format(name, want))
+    frames.append("C {} {} {:08x}".format(cframe(cid, cmd).hex(), n, cid))
+
+
+ccase("full 64-byte frame, matching cid", LOWN, 0x91, 64, 1)
+ccase("n=63 matching", LOWN, 0x91, 63, 1)
+ccase("n=6 matching", LOWN, 0x91, 6, 1)
+ccase("n=5 boundary matching", LOWN, 0x91, 5, 1)
+ccase("n=4 too short to carry a command byte", LOWN, 0x91, 4, 0)
+ccase("n=64 wrong command byte is not a cancel", LOWN, 0x86, 64, 0)
+ccase("n=64 mismatched cid", LOTH, 0x91, 64, 0)
+ccase("broadcast frame matching broadcast cid", BROADCAST, 0x91, 5, 1)
+ccase("broadcast frame, mismatched cid", LOWN, 0x91, 5, 0)
+
+# the 2x2 keepalive table lives in difftest output already; finish the cancel
+# family with the tiny-n differential gold rows
+ccase("n=63 mismatched", LOTH, 0x91, 63, 0)
+ccase("n=6 non-cancel cmd", LOWN, 0x81, 6, 0)
+
+# channel lock: expiry boundary, strict < (until == now is unblocked). arm
+# owner t=2s at now=1000 -> until=3000, then probe at 2999/3000/3001.
+
+
+def larm(name, cid, secs, now):
+    frames.append("# lock: " + name)
+    frames.append("L arm {:08x} {} {}".format(cid, secs, now))
+
+
+def lrefuse(name, cid, cmd, now):
+    frames.append("# lock: " + name)
+    frames.append("L refuse {:08x} {:02x} {}".format(cid, cmd & 0xFF, now))
+
+
+larm("expiry boundary cluster: arm owner 2s", LOWN, 2, 1000)
+lrefuse("owner at until-1 not blocked", LOWN, 0x81, 2999)
+lrefuse("other at until-1 blocked", LOTH, 0x81, 2999)
+lrefuse("owner at until not blocked", LOWN, 0x81, 3000)
+lrefuse("other at until == unblocked (strict <)", LOTH, 0x81, 3000)
+lrefuse("owner at until+1 not blocked", LOWN, 0x81, 3001)
+lrefuse("other at until+1 unblocked", LOTH, 0x81, 3001)
+lrefuse("broadcast INIT at until-1 carve-out", BROADCAST, 0x86, 2999)
+lrefuse("broadcast INIT at until+1 carve-out", BROADCAST, 0x86, 3001)
+
+# carve-out matrix: cmd x cid at a now well before any expiry (arm holds for 5s)
+larm("carve-out matrix: owner locks 5s", LOWN, 5, 1000)
+for cmd in (0x86, 0x81, 0x83, 0x91, 0xBB):
+    for cid, tag in ((LOWN, "owner"), (LOTH, "other"), (BROADCAST, "broadcast")):
+        want = "unblocked"
+        if cid != LOWN and not (cmd == 0x86 and cid == BROADCAST):
+            want = "blocked"
+        lrefuse("carve-out cmd=0x{0:02x} cid={1} -> {2}".format(cmd, tag, want),
+                cid, cmd, 1500)
+
+# release ownership: only the owner may release
+larm("release: owner locks 10s", LOWN, 10, 1000)
+lrefuse("other blocked before release", LOTH, 0x81, 1500)
+larm("non-owner release is ignored", LOTH, 0, 1500)
+lrefuse("still blocked after non-owner release attempt", LOTH, 0x81, 1500)
+larm("owner release clears", LOWN, 0, 1500)
+lrefuse("other unblocked after owner release", LOTH, 0x81, 1500)
+lrefuse("other unblocked after owner release, later now", LOTH, 0x83, 3000)
+
+# secs=0 on a fresh lock is a harmless no-op (no lock was ever taken)
+lrefuse("fresh lock refuses nothing", LOTH, 0x81, 500)
+larm("secs=0 on a fresh lock is a no-op", LOTH, 0, 500)
+lrefuse("still nothing refused", LOTH, 0x81, 1500)
+
+# non-monotonic now_ms: the kernel must not assume a clock that advances
+larm("non-monotonic now: arm owner 2s", LOWN, 2, 1000)
+lrefuse("refuse at an earlier now still respects the lock", LOTH, 0x81, 500)
+
+# malformed control lines: both sides must X-parse identically
+frames.append("# malformed: cancel n out of range (65) X-parses")
+frames.append("C {} 65 {:08x}".format(cframe(LOWN, 0x91).hex(), LOWN))
+frames.append("# malformed: cancel frame short of 128 hex X-parses")
+frames.append("C {} 64 {:08x}".format(cframe(LOWN, 0x91).hex()[:-2], LOWN))
+frames.append("# malformed: keepalive is_cbor not 0/1 X-parses")
+frames.append("K 2 0")
+frames.append("# malformed: keepalive missing the up_pending field X-parses")
+frames.append("K 1")
+frames.append("# malformed: arm secs not decimal X-parses")
+frames.append("L arm {:08x} abc 1000".format(LOWN))
+frames.append("# malformed: refuse cmd not 2 hex digits X-parses")
+frames.append("L refuse {:08x} 0 1000".format(LOWN))
+frames.append("# malformed: refuse unknown op X-parses")
+frames.append("L bogus {:08x} 81 1000".format(LOWN))
+frames.append("# malformed: refuse cid short of 8 hex X-parses")
+frames.append("L refuse 1122 81 1000")
+
 print("\n".join(frames))

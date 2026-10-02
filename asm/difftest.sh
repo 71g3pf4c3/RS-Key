@@ -26,10 +26,11 @@ CFLAGS="-mcpu=cortex-m33 -mthumb -mfloat-abi=soft -ffreestanding -fno-builtin -n
 arm-none-eabi-gcc $CFLAGS -c ctaphid.S -o "$OUT/ctaphid.o"
 arm-none-eabi-gcc $CFLAGS -c ctaphid_tx.S -o "$OUT/ctaphid-tx.o"
 arm-none-eabi-gcc $CFLAGS -c ctaphid_init.S -o "$OUT/ctaphid-init.o"
+arm-none-eabi-gcc $CFLAGS -c ctaphid_ctrl.S -o "$OUT/ctaphid-ctrl.o"
 arm-none-eabi-gcc $CFLAGS -c difftest.S -o "$OUT/difftest-s.o"
 arm-none-eabi-gcc $CFLAGS -Os -c difftest.c -o "$OUT/difftest-c.o"
 arm-none-eabi-gcc -nostdlib -static -Wl,--build-id=none -e _start \
-    -o "$OUT/difftest.elf" "$OUT/ctaphid.o" "$OUT/ctaphid-tx.o" "$OUT/ctaphid-init.o" "$OUT/difftest-s.o" "$OUT/difftest-c.o"
+    -o "$OUT/difftest.elf" "$OUT/ctaphid.o" "$OUT/ctaphid-tx.o" "$OUT/ctaphid-init.o" "$OUT/ctaphid-ctrl.o" "$OUT/difftest-s.o" "$OUT/difftest-c.o"
 arm-none-eabi-objdump -d "$OUT/difftest.elf" > "$OUT/difftest.disasm"
 arm-none-eabi-size "$OUT/difftest.elf"
 
@@ -47,13 +48,13 @@ echo "   $(wc -l < "$OUT/spec-asm.txt") events identical"
 
 total=0
 for seed in 1 2 3 4 5; do
-    for mode in noise mixed tx; do
+    for mode in noise mixed tx ctrl; do
         python3 gen_random.py "$seed" "$FUZZ" "$mode" > "$OUT/fuzz.txt"
         "$QEMU_BIN" "$OUT/difftest.elf" < "$OUT/fuzz.txt" > "$OUT/fuzz-asm.txt"
         "$ORACLE" < "$OUT/fuzz.txt" > "$OUT/fuzz-rust.txt"
         cmp "$OUT/fuzz-asm.txt" "$OUT/fuzz-rust.txt" \
             || { echo "DIFF FAILED on fuzz seed $seed ($mode):" >&2; diff "$OUT/fuzz-asm.txt" "$OUT/fuzz-rust.txt" | head -6 >&2; exit 1; }
     done
-    total=$((total + 3 * FUZZ))
+    total=$((total + 4 * FUZZ))
 done
 echo "== differential clean: spec vectors + $total random frames =="

@@ -27,6 +27,14 @@ struct init_state {
     unsigned next_cid;
 };
 
+/* mirror of asm/ctaphid_ctrl.S's caller-owned lock state: cid plus the
+ * until_ms u64 split into two words (until_lo/until_hi), zero-init */
+struct lock_state {
+    unsigned cid;
+    unsigned until_lo;
+    unsigned until_hi;
+};
+
 #define MSG_CAP 7609 /* CTAP_MAX_MESSAGE: 57 + 128*59 */
 
 extern void ctaphid_feed(struct state *st, const unsigned char *rpt);
@@ -43,6 +51,7 @@ extern long sys_write(long fd, const void *buf, long n);
 static struct state st;
 static struct tx_state txs;
 static struct init_state inis;
+static struct lock_state lks;
 static unsigned char msgbuf[MSG_CAP];
 static unsigned char paybuf[MSG_CAP];
 static unsigned char tframe[64];
@@ -108,6 +117,114 @@ static unsigned char *hexn(unsigned char *p, const unsigned char *b, unsigned n)
 static void emit(const unsigned char *p, unsigned len)
 {
     sys_write(1, p, len);
+}
+
+/* the control lines are whitespace-separated; replicate Rust's split(' ')
+ * exactly so parsed field counts agree on malformed input (consecutive
+ * spaces → empty fields). The outer trim() leaves no leading/trailing
+ * separators, so `("a b c") -> 3` and `("a  b") -> 3` with an empty middle. */
+#define MAX_FIELDS 6
+struct field {
+    const unsigned char *p;
+    unsigned len;
+};
+static unsigned split_fields(const unsigned char *p, const unsigned char *eol,
+                             struct field *out, unsigned max)
+{
+    const unsigned char *q = p;
+    unsigned n = 0;
+    while (q <= eol) {
+        const unsigned char *s = q;
+        while (q < eol && *q != ' ') q++;
+        if (n < max) {
+            out[n].p = s;
+            out[n].len = (unsigned)(q - s);
+        }
+        n++;
+        if (q >= eol) break;
+        q++;
+    }
+    return n;
+}
+
+/* decimal u64, no libc: any non-digit or >u64::MAX overflows cleanly, which
+ * X-parses exactly where Rust's u64::from_str returns Err. The overflow guard
+ * uses compile-time constants for u64::MAX/10 = 1844674407370955161 and
+ * u64::MAX%10 = 5 — not runtime division, which would drag in __aeabi_uldivmod
+ * that this freestanding harness has no libc to satisfy. */
+#define U64_MAX_DIV10 1844674407370955161ULL
+#define U64_MAX_MOD10 5
+static int parse_dec_u64(const unsigned char *p, unsigned len, unsigned long long *v)
+{
+    unsigned long long x = 0;
+    if (len == 0) return 0;
+    for (unsigned i = 0; i < len; i++) {
+        if (p[i] < '0' || p[i] > '9') return 0;
+        unsigned d = (unsigned)(p[i] - '0');
+        if (x > U64_MAX_DIV10 || (x == U64_MAX_DIV10 && d > U64_MAX_MOD10))
+            return 0;
+        x = x * 10 + d;
+    }
+    *v = x;
+    return 1;
+}
+
+/* decimal u32 within [0, bound]; the cancel n and arm secs fields are bounded
+ * up front so an out-of-range value X-parses identically on both sides */
+static int parse_dec_u32_bounded(const unsigned char *p, unsigned len,
+                                 unsigned long long bound, unsigned *v)
+{
+    unsigned long long x;
+    if (!parse_dec_u64(p, len, &x) || x > bound) return 0;
+    *v = (unsigned)x;
+    return 1;
+}
+
+static int parse_hex_u32(const unsigned char *p, unsigned len, unsigned *v)
+{
+    if (len != 8) return 0;
+    unsigned x = 0;
+    for (unsigned i = 0; i < 8; i++) {
+        int n = hexval(p[i]);
+        if (n < 0) return 0;
+        x = (x << 4) | (unsigned)n;
+    }
+    *v = x;
+    return 1;
+}
+
+static int parse_hex_byte(const unsigned char *p, unsigned len, unsigned char *v)
+{
+    if (len != 2) return 0;
+    int hi = hexval(p[0]), lo = hexval(p[1]);
+    if (hi < 0 || lo < 0) return 0;
+    *v = (unsigned char)((hi << 4) | lo);
+    return 1;
+}
+
+static int parse_hex_n(const unsigned char *p, unsigned len, unsigned char *out)
+{
+    if (len & 1) return 0;
+    for (unsigned i = 0; i < len; i += 2) {
+        int hi = hexval(p[i]), lo = hexval(p[i + 1]);
+        if (hi < 0 || lo < 0) return 0;
+        out[i / 2] = (unsigned char)((hi << 4) | lo);
+    }
+    return 1;
+}
+
+extern unsigned ctaphid_keepalive_status(unsigned is_cbor, unsigned up_pending);
+extern unsigned ctaphid_is_cancel(const unsigned char *frame, unsigned n,
+                                  unsigned cid);
+extern void ctaphid_lock_arm(struct lock_state *st, unsigned cid, unsigned secs,
+                             unsigned now_lo, unsigned now_hi);
+extern unsigned ctaphid_lock_refuses(struct lock_state *st, unsigned cid,
+                                     unsigned cmd, unsigned now_lo,
+                                     unsigned now_hi);
+
+static void parse_error(void)
+{
+    emit((const unsigned char *)"X parse\n", 8);
 }
 
 static void process_line(unsigned char *p, unsigned char *eol)
@@ -198,6 +315,93 @@ static void process_line(unsigned char *p, unsigned char *eol)
             emit(out, o - out);
             n++;
         }
+        return;
+    }
+
+    /* keepalive status: "K <is_cbor 0|1> <up_pending 0|1>" -> "S 00|01|02" */
+    if (*p == 'K' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        if (nf != 2 || f[0].len != 1 || f[1].len != 1 ||
+            !((f[0].p[0] == '0' || f[0].p[0] == '1') &&
+              (f[1].p[0] == '0' || f[1].p[0] == '1'))) {
+            parse_error();
+            return;
+        }
+        unsigned r = ctaphid_keepalive_status(
+            (unsigned)(f[0].p[0] - '0'), (unsigned)(f[1].p[0] - '0'));
+        unsigned char *o = out;
+        *o++ = 'S'; *o++ = ' ';
+        o = hex2(o, r);
+        *o++ = '\n';
+        emit(out, o - out);
+        return;
+    }
+
+    /* cancel detection: "C <128-hex frame> <n dec> <cid 8-hex>" -> "C 0|1" */
+    if (*p == 'C' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        unsigned char frame[64], cmd;
+        unsigned n, cid;
+        int ok = nf == 3 && f[0].len == 128 && parse_hex_n(f[0].p, f[0].len, frame) &&
+                 parse_dec_u32_bounded(f[1].p, f[1].len, 64, &n) &&
+                 parse_hex_u32(f[2].p, f[2].len, &cid);
+        if (!ok) {
+            parse_error();
+            return;
+        }
+        unsigned r = ctaphid_is_cancel(frame, n, cid);
+        unsigned char *o = out;
+        *o++ = 'C'; *o++ = ' ';
+        *o++ = (unsigned char)('0' + r); *o++ = '\n';
+        emit(out, o - out);
+        return;
+    }
+
+    /* channel lock: "L arm <cid 8-hex> <secs dec> <now_ms dec>" persists the
+     * lock state; "L refuse <cid 8-hex> <cmd 2-hex> <now_ms dec>" -> "R 0|1". */
+    if (*p == 'L' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        unsigned cid, secs, now_lo, now_hi;
+        unsigned char cmd;
+        unsigned long long now;
+        if (nf != 4) {
+            parse_error();
+            return;
+        }
+        if (f[0].len == 3 && f[0].p[0] == 'a' && f[0].p[0 + 1] == 'r' && f[0].p[2] == 'm') {
+            if (!(parse_hex_u32(f[1].p, f[1].len, &cid) &&
+                  parse_dec_u32_bounded(f[2].p, f[2].len, 255, &secs) &&
+                  parse_dec_u64(f[3].p, f[3].len, &now))) {
+                parse_error();
+                return;
+            }
+            now_lo = (unsigned)now;
+            now_hi = (unsigned)(now >> 32);
+            ctaphid_lock_arm(&lks, cid, secs, now_lo, now_hi);
+            return; /* arm emits nothing; the lock persists for later lines */
+        }
+        if (f[0].len == 6 && f[0].p[0] == 'r' && f[0].p[1] == 'e' &&
+            f[0].p[2] == 'f' && f[0].p[3] == 'u' && f[0].p[4] == 's' &&
+            f[0].p[5] == 'e') {
+            if (!(parse_hex_u32(f[1].p, f[1].len, &cid) &&
+                  parse_hex_byte(f[2].p, f[2].len, &cmd) &&
+                  parse_dec_u64(f[3].p, f[3].len, &now))) {
+                parse_error();
+                return;
+            }
+            now_lo = (unsigned)now;
+            now_hi = (unsigned)(now >> 32);
+            unsigned r = ctaphid_lock_refuses(&lks, cid, (unsigned)cmd, now_lo, now_hi);
+            unsigned char *o = out;
+            *o++ = 'R'; *o++ = ' ';
+            *o++ = (unsigned char)('0' + r); *o++ = '\n';
+            emit(out, o - out);
+            return;
+        }
+        parse_error();
         return;
     }
 

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 RS-Key contributors
 
 use rsk_usb::ctaphid::{
-    init_capabilities, CidAllocator, Outcome, Reassembler, TxFrames, CTAPHID_IF_VERSION,
-    HID_RPT_SIZE,
+    init_capabilities, is_cancel_frame, keepalive_status, ChannelLock, CidAllocator, Outcome,
+    Reassembler, TxFrames, CTAPHID_IF_VERSION, HID_RPT_SIZE,
 };
 use std::io::Read;
 
@@ -29,6 +29,7 @@ fn main() {
     std::io::stdin().read_to_string(&mut input).unwrap();
     let mut re = Reassembler::new();
     let mut allocator = CidAllocator::new();
+    let mut lock = ChannelLock::default();
     let mut out = String::new();
 
     for line in input.lines() {
@@ -94,6 +95,91 @@ fn main() {
                     out.push_str(&format!("{:02x}", b));
                 }
                 out.push('\n');
+            }
+            continue;
+        }
+
+        // keepalive status: "K <is_cbor 0|1> <up_pending 0|1>" -> "S 00|01|02"
+        if let Some(rest) = l.strip_prefix("K ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            match parts.as_slice() {
+                [a, b] if (*a == "0" || *a == "1") && (*b == "0" || *b == "1") => {
+                    let is_cbor = *a == "1";
+                    let up_pending = *b == "1";
+                    let s = match keepalive_status(is_cbor, up_pending) {
+                        None => 0u8,
+                        Some(v) => v,
+                    };
+                    out.push_str(&format!("S {:02x}\n", s));
+                }
+                _ => {
+                    out.push_str("X parse\n");
+                }
+            }
+            continue;
+        }
+
+        // cancel detection: "C <128-hex frame> <n dec> <cid 8-hex>" -> "C 0|1"
+        if let Some(rest) = l.strip_prefix("C ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            let parse = match parts.as_slice() {
+                [frame_h, n_s, cid_s] if frame_h.len() == 128 && cid_s.len() == 8 => {
+                    let frame = parse_hex(frame_h);
+                    let n = n_s.parse::<u32>().ok().filter(|n| *n <= 64);
+                    let cid = u32::from_str_radix(cid_s, 16).ok();
+                    match (frame, n, cid) {
+                        (Some(f), Some(n), Some(c)) if f.len() == 64 => {
+                            let mut arr = [0u8; 64];
+                            arr.copy_from_slice(&f);
+                            is_cancel_frame(&arr, n as usize, c)
+                        }
+                        _ => {
+                            out.push_str("X parse\n");
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    out.push_str("X parse\n");
+                    continue;
+                }
+            };
+            out.push_str(if parse { "C 1\n" } else { "C 0\n" });
+            continue;
+        }
+
+        // channel lock: "L arm|refuse ..." lines (see difftest.c for the
+        // grammar); an arm persists the lock, a refuse prints "R 0|1".
+        if let Some(rest) = l.strip_prefix("L ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            match parts.as_slice() {
+                ["arm", cid_s, secs_s, now_s] if cid_s.len() == 8 => {
+                    let cid = u32::from_str_radix(cid_s, 16);
+                    let secs = secs_s.parse::<u32>().ok().filter(|s| *s <= 255);
+                    let now = now_s.parse::<u64>().ok();
+                    match (cid, secs, now) {
+                        (Ok(c), Some(s), Some(n)) => lock.arm(c, s as u8, n),
+                        _ => {
+                            out.push_str("X parse\n");
+                        }
+                    }
+                }
+                ["refuse", cid_s, cmd_s, now_s] if cid_s.len() == 8 && cmd_s.len() == 2 => {
+                    let cid = u32::from_str_radix(cid_s, 16);
+                    let cmd = u8::from_str_radix(cmd_s, 16);
+                    let now = now_s.parse::<u64>().ok();
+                    let r = match (cid, cmd, now) {
+                        (Ok(c), Ok(m), Some(n)) => lock.refuses(c, m, n),
+                        _ => {
+                            out.push_str("X parse\n");
+                            continue;
+                        }
+                    };
+                    out.push_str(if r { "R 1\n" } else { "R 0\n" });
+                }
+                _ => {
+                    out.push_str("X parse\n");
+                }
             }
             continue;
         }

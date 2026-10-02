@@ -14,6 +14,11 @@ tx:    "T cid cmd payload" lines — response framing with random lengths,
         cmds with and without the INIT bit, and edge cids; roughly every
         third line is instead an "I can_wink nonce-hex" INIT allocation
         demand, so the differential also fuzzes the reply composition.
+ctrl:  transport-control lines — "K is_cbor up_pending" keepalive, "C frame
+        n cid" cancel detection, and "L arm/refuse ..." channel-lock lines
+        with random lock times (0..10 s and occasionally past the dispatcher's
+        LOCK_MAX_SECONDS clamp, which neither side may apply) and now_ms drift
+        that crosses lock expiry.
 """
 
 import random
@@ -21,6 +26,9 @@ import struct
 import sys
 
 CIDS = [0x11223344, 0xAABBCCDD, 0x01020304, 0xFFFFFFFF, 0]
+LOWNCIDS = [0x11223344, 0xAABBCCDD, 0x01020304]
+CONTROL_CMDS = [0x86, 0x81, 0x83, 0x91, 0xBB]
+LOCK_SECS = [0, 1, 2, 5, 9, 10, 11, 12, 15, 20, 30, 40]
 
 
 def pat(rng, n):
@@ -76,6 +84,66 @@ def tx_line(rng):
     return "T {:08x} {:02x} {}".format(cid, cmd, pat(rng, ln).hex())
 
 
+def cancel_frame(cid, cmd):
+    b = bytearray(64)
+    b[0:4] = struct.pack("<I", cid)
+    b[4] = cmd
+    return bytes(b)
+
+
+def ctrl_lines(rng, n):
+    """Random transport-control lines. The lock context is threaded through so
+    refuse lines land at random now_ms around a just-taken lock's expiry —
+    exercising the strict-boundary comparison the expiry tests pin."""
+    out = []
+    active = None  # (cid, until_ms) of the last arm(secs>0), or None
+
+    def arm_line():
+        nonlocal active
+        cid = rng.choice(LOWNCIDS + [0xFFFFFFFF])
+        secs = rng.choice(LOCK_SECS)
+        now = rng.randrange(0, 10_000_000)
+        if secs > 0:
+            active = (cid, now + secs * 1000)
+        elif active and active[0] == cid:
+            active = None  # an owner release clears; a non-owner's is ignored
+        return "L arm {:08x} {} {}".format(cid, secs, now)
+
+    def refuse_line():
+        cid = rng.choice(CIDS)
+        cmd = rng.choice(CONTROL_CMDS)
+        if active and rng.random() < 0.8:
+            # probe across the active lock's expiry instant
+            until = active[1]
+            now = rng.choice(
+                [until - rng.randrange(0, 3000), until - 1, until, until + 1,
+                 until + rng.randrange(0, 3000)]
+            )
+        else:
+            now = rng.randrange(0, 10_000_000)
+        return "L refuse {:08x} {:02x} {}".format(cid, cmd, max(now, 0))
+
+    for _ in range(n):
+        r = rng.random()
+        if r < 0.25:
+            out.append("K {} {}".format(
+                rng.choice(["0", "1"]), rng.choice(["0", "1"])))
+        elif r < 0.55:
+            out.append(refuse_line())
+        elif r < 0.80:
+            out.append(arm_line())
+            if active and rng.random() < 0.4:
+                # a short burst of refuses right at the new lock's boundary
+                for _ in range(rng.randrange(1, 4)):
+                    out.append(refuse_line())
+        else:
+            cid = rng.choice(CIDS)
+            b = cancel_frame(cid, rng.choice([0x91, 0x86, 0x81, rng.randrange(0x100)]))
+            nf = rng.randrange(0, 66)  # 0..65; 65 X-parses identically both sides
+            out.append("C {} {} {:08x}".format(b.hex(), nf, cid))
+    return out
+
+
 def main():
     seed = int(sys.argv[1])
     n = int(sys.argv[2])
@@ -90,6 +158,9 @@ def main():
             else:
                 out.append(tx_line(rng))
         print("\n".join(out))
+        return
+    if mode == "ctrl":
+        print("\n".join(ctrl_lines(rng, n)))
         return
     tx = None  # live valid transaction: (cid, payload, off, seq)
     for _ in range(n):

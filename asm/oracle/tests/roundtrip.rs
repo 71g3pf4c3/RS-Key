@@ -276,3 +276,90 @@ fn init_payload_layout() {
     );
     assert_eq!(payload[16], init_capabilities(can_wink));
 }
+
+/// The 2x2 keepalive truth table, pinned by the shipping
+/// `keepalive_status_suppresses_processing_for_u2f_msg`: a touch wait always
+/// signals UPNEEDED, only a slow CBOR op gets PROCESSING, and a fast U2F op
+/// stays silent. The asm kernel's tables lies in that this is the exact table:
+/// (0,0)->None, (0,1)->UPNEEDED, (1,0)->PROCESSING, (1,1)->UPNEEDED.
+#[test]
+fn keepalive_status_table() {
+    use rsk_usb::ctaphid::{keepalive_status, STATUS_PROCESSING, STATUS_UPNEEDED};
+
+    assert_eq!(keepalive_status(false, false), None); // U2F fast op — stay silent
+    assert_eq!(keepalive_status(false, true), Some(STATUS_UPNEEDED)); // U2F touch wait
+    assert_eq!(keepalive_status(true, false), Some(STATUS_PROCESSING)); // CBOR slow op
+    assert_eq!(keepalive_status(true, true), Some(STATUS_UPNEEDED)); // CBOR touch wait
+}
+
+/// The cancel rule, pinned by the shipping
+/// `cancel_frame_detected_only_for_active_channel` (n = 64, n = 4), plus the
+/// n in [5, 63] band — closed by the differential only, so this pins the
+/// high-value short-read rows against the pub API.
+#[test]
+fn cancel_frame_contract() {
+    use rsk_usb::ctaphid::{is_cancel_frame, CTAPHID_CANCEL, CTAPHID_PING};
+
+    let mut frame = [0u8; HID_RPT_SIZE];
+    frame[0..4].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+    frame[4] = CTAPHID_CANCEL;
+    assert!(is_cancel_frame(&frame, HID_RPT_SIZE, 0x0100_0000)); // full frame
+    assert!(!is_cancel_frame(&frame, 4, 0x0100_0000)); // no command byte
+    assert!(!is_cancel_frame(&frame, HID_RPT_SIZE, 0x0200_0000)); // other channel
+    let mut ping = frame;
+    ping[4] = CTAPHID_PING;
+    assert!(!is_cancel_frame(&ping, HID_RPT_SIZE, 0x0100_0000)); // not a cancel
+                                                                 // The differential-only gold band no shipping test pins.
+    assert!(is_cancel_frame(&frame, 5, 0x0100_0000));
+    assert!(!is_cancel_frame(&frame, 63, 0xFFFF_FFFF));
+}
+
+/// The strict-expiry boundary and the ownership rules of the channel lock,
+/// pinned by the shipping `channel_lock_excludes_other_channels_until_it_expires`
+/// and `only_a_broadcast_init_survives_someone_elses_lock`. The highest-value
+/// row is the equality instant: arm(2s) at t=1000 goes unblocked at t=3000.
+#[test]
+fn channel_lock_strict_expiry_boundary() {
+    use rsk_usb::ctaphid::{ChannelLock, CID_BROADCAST, CTAPHID_INIT, CTAPHID_PING};
+
+    let mut lock = ChannelLock::default();
+    let (mine, theirs) = (0x0100_0000u32, 0x0100_0001u32);
+    lock.arm(mine, 2, 1_000);
+    assert!(
+        lock.refuses(theirs, CTAPHID_PING, 2_999),
+        "other, before expiry"
+    );
+    assert!(
+        !lock.refuses(mine, CTAPHID_PING, 2_999),
+        "owner is never blocked"
+    );
+    assert!(
+        !lock.refuses(theirs, CTAPHID_PING, 3_000),
+        "until == now is NOT blocked (strict <)"
+    );
+    assert!(!lock.refuses(theirs, CTAPHID_PING, 3_001), "expired");
+
+    // Only a broadcast INIT survives someone else's lock (an allocation, not
+    // traffic on a channel); an INIT aimed at another channel is refused.
+    lock.arm(mine, 5, 10_000);
+    assert!(
+        !lock.refuses(CID_BROADCAST, CTAPHID_INIT, 10_500),
+        "broadcast INIT allocation is never refused"
+    );
+    assert!(
+        lock.refuses(theirs, CTAPHID_INIT, 10_500),
+        "channel resync refused"
+    );
+
+    // A release by a non-owner does not hand the lock back; the owner's does.
+    lock.arm(theirs, 0, 10_500);
+    assert!(
+        lock.refuses(theirs, CTAPHID_PING, 10_600),
+        "non-owner release is ignored"
+    );
+    lock.arm(mine, 0, 10_600);
+    assert!(
+        !lock.refuses(theirs, CTAPHID_PING, 10_700),
+        "owner release clears the lock"
+    );
+}
