@@ -8,7 +8,8 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
-OUT="$(git rev-parse --show-toplevel 2>/dev/null || echo ..)/target/asm"
+OUT="${USBTEST_OUT:-$(git rev-parse --show-toplevel 2>/dev/null || echo ..)/target/asm}"
+mkdir -p "$OUT"
 QEMU_BIN="${QEMU:-qemu-arm}"
 command -v "$QEMU_BIN" >/dev/null || { echo "qemu-arm not found; set QEMU=" >&2; exit 2; }
 

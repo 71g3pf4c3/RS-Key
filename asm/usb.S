@@ -71,7 +71,11 @@
 .equ REQ_GET_IFACE,     0x0a
 .equ DESC_DEVICE, 0x01
 .equ DESC_CONFIG,  0x02
+.equ DESC_STRING,  0x03
 .equ DESC_REPORT,  0x22
+.equ STR_MANUF,     1
+.equ STR_PROD,      2
+.equ LANGID_US,     0x0409
 
 /* offsets into asm/ctaphid.S's caller state (kept in sync by hand) */
 .equ ST_CID,     0
@@ -105,7 +109,7 @@ ctaphid_msg:
 .global usb_dev_desc
 usb_dev_desc:
     .byte 0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40
-    .byte 0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01
+    .byte 0x09, 0x12, 0x01, 0x00, 0x00, 0x01, STR_MANUF, STR_PROD, 0x00, 0x01
 
 .global usb_cfg_desc
 usb_cfg_desc:
@@ -121,6 +125,26 @@ usb_report_desc:
     .byte 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0x81, 0x02, 0x09
     .byte 0x21, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40
     .byte 0x91, 0x02, 0xC0
+
+/* string index 0: LANGUAGE ID (§9.6.7), 0x0409 little-endian */
+.global usb_str_langid
+usb_str_langid:
+    .byte 4, DESC_STRING
+    .hword LANGID_US
+
+/* string index 1: manufacturer "RS-Key contributors" */
+.global usb_str_manuf
+usb_str_manuf:
+    .byte 40, DESC_STRING      /* 2 + 2*19 */
+    .hword 0x52, 0x53, 0x2D, 0x4B, 0x65, 0x79, 0x20   /* "RS-Key " */
+    .hword 0x63, 0x6F, 0x6E, 0x74, 0x72, 0x69, 0x62   /* contribut */
+    .hword 0x75, 0x74, 0x6F, 0x72, 0x73               /* ors */
+
+/* string index 2: product "RS-Key" */
+.global usb_str_prod
+usb_str_prod:
+    .byte 14, DESC_STRING      /* 2 + 2*6 */
+    .hword 0x52, 0x53, 0x2D, 0x4B, 0x65, 0x79         /* "RS-Key" */
 
 .section .text
 .thumb_func
@@ -271,9 +295,27 @@ get_descriptor:
         movs r0, #41
         b    send_desc
 4:      cmp  r2, #DESC_REPORT
-        bne  stall_both
+        bne  8f
         ldr  r3, =usb_report_desc
         movs r0, #33
+        b    send_desc
+8:      cmp  r2, #DESC_STRING
+        bne  stall_both
+        ldrb r2, [r5, #D_SETUP+2]     /* wValue lo = string index */
+        cmp  r2, #STR_MANUF
+        bne  9f
+        ldr  r3, =usb_str_manuf
+        movs r0, #40
+        b    send_desc
+9:      cmp  r2, #STR_PROD
+        bne  10f
+        ldr  r3, =usb_str_prod
+        movs r0, #14
+        b    send_desc
+10:     cmp  r2, #0
+        bne  stall_both               /* unknown index */
+        ldr  r3, =usb_str_langid
+        movs r0, #4
 send_desc:
         cmp  r0, r6
         bls  5f
