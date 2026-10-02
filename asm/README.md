@@ -24,11 +24,12 @@ here. No file here is linked into a firmware binary.
 | `ctaphid.S` | CTAPHID reassembly kernel (CTAP 2.1 §11.2.9). Pure: no hardware, no allocator; parses host-controlled framing and emits events (busy/done/error/ignored). The differentially tested core. |
 | `ctaphid_tx.S` | CTAPHID transmission framing kernel — the mirror of `ctaphid.S`: splits one outgoing message into 64-byte reports (an INIT then CONTs, always at least the INIT). The `cmd` byte is stored verbatim, matching the shipping `TxFrames` contract. |
 | `ctaphid_init.S` | CTAPHID INIT allocation kernel (CTAP 2.1 §11.2.9.4): a persistent `next_cid` counter plus the 17-byte reply composition (nonce‖newcid LE‖iface‖version‖capabilities). The allocator wrap rule is spec-pinned (cited from the shipping tests); the values are differentially cross-checked against `CidAllocator` + `init_capabilities` + `rsk_sdk::FIRMWARE_VERSION`. |
+| `ctaphid_ctrl.S` | CTAPHID transport-control predicates: the keepalive 2×2, cancel-frame detection (with the `n ∈ [5,63]` threshold the shipping tests leave unpinned), and the per-channel lock (u64 strict-expiry arithmetic, owner-only release, broadcast-INIT carve-out) with the caller supplying `now_ms` — clock-free, like the firmware feeds it. |
 | `difftest.S` | Linux user-mode entry for the differential harness: raw EABI syscalls, no libc. |
-| `difftest.c` | Differential harness driver: one 64-byte report per stdin line → `ctaphid_feed`, prints the event stream in the oracle's exact format; `T <cid> <cmd> <payload-hex>` lines drive `ctaphid_tx.S`, `I <can_wink> <nonce-hex>` lines drive `ctaphid_init.S` — both print the resulting frame stream. Streams input line-by-line so no input size is truncated. |
+| `difftest.c` | Differential harness driver: one 64-byte report per stdin line → `ctaphid_feed`, prints the event stream in the oracle's exact format; `T <cid> <cmd> <payload-hex>` lines drive `ctaphid_tx.S`, `I <can_wink> <nonce-hex>` lines drive `ctaphid_init.S`, and `K`/`C`/`L` lines drive `ctaphid_ctrl.S` — the frame/predicate outputs share one stream. Streams input line-by-line so no input size is truncated. |
 | `difftest.sh` | Builds the ARM side + Rust oracle, then requires byte-identical event streams over the spec vectors and seeded random frames. |
 | `gen_vectors.py` | Spec/reassembly vectors (CTAP 2.1 §11.2.9): single/multi-packet, gaps, cross-channel, broadcast, cap-overflow, maximum 7609-byte message; plus TX framing cases with boundary lengths. |
-| `gen_random.py` | Seeded random frames for the fuzz differential: `noise` (uniform garbage around the framing), `mixed` (valid transactions with noise interleaved on live state) and `tx` (random response-framing lines). |
+| `gen_random.py` | Seeded random frames for the fuzz differential: `noise` (uniform garbage around the framing), `mixed` (valid transactions with noise interleaved on live state), `tx` (random response-framing and INIT-allocation lines) and `ctrl` (random keepalive/cancel/lock lines, including expiry-crossing `now_ms` sequences). |
 | `oracle/` | Rust differential oracle over rsk-usb's `Reassembler` and `TxFrames` — the **shipping** implementations. A detached cargo workspace (the `tools/emu` pattern); links `rsk-usb` from `../../crates/rsk-usb` for host execution only. |
 | `usb.S` | USB device-side driver for the RP2350 USBCTRL block: chapter-9 EP0 control transfers (device/config/string/report descriptors) plus the EP1 interrupt endpoints that carry CTAPHID. Plain MMIO, one event per `usb_task`; register facts cite pico-sdk 2.2.0 headers. |
 | `usbtest.c` | Model-level USB harness: maps the USBCTRL register file + DPSRAM as plain memory under qemu-user and runs the driver against a datasheet-derived SIE model. Includes an end-to-end echo: host frames in via EP1 OUT → reassembly → TX framing → `usb_send_ep1` → the model host reads the frames back out of EP1 IN DPRAM, byte-compared against the kernel output. |
@@ -60,14 +61,14 @@ QEMU=/nix/store/m4qamr94ba84viib1l2wskzwr90hbmmn-qemu-10.2.4/bin/qemu-arm \
 nix develop -c ./asm/difftest.sh [frames_per_seed]
 ```
 
-Default 700 frames/seed × 5 seeds × {noise, mixed, tx}; spec vectors always run
+Default 700 frames/seed × 5 seeds × {noise, mixed, tx, ctrl}; spec vectors always run
 first. The oracle builds with an explicit host target triple (`HOST_TARGET`,
-defaulting to the current `rustc` host). Green means the ARM reassembly and
-framing kernels and the shipping `rsk-usb` `Reassembler`/`TxFrames` emit
-**byte-identical** streams — a divergence is an asm bug or a spec reading to
-adjudicate, never noise. The two kernels also round-trip: frames emitted by
-`ctaphid_tx.S` fed back into `ctaphid.S` reassemble to the original payload
-(verified at the 7609-byte maximum: 1 INIT + 128 CONTs).
+defaulting to the current `rustc` host). Green means the ARM kernels and the
+shipping `rsk-usb` implementations emit **byte-identical** streams — a
+divergence is an asm bug or a spec reading to adjudicate, never noise. The
+RX and TX kernels also round-trip: frames emitted by `ctaphid_tx.S` fed back
+into `ctaphid.S` reassemble to the original payload (verified at the
+7609-byte maximum: 1 INIT + 128 CONTs).
 
 ### USB model tests
 
@@ -86,14 +87,17 @@ Fails if a wrong-register poll would hang the driver (guarded by `timeout 60`).
 
 ## Verification status
 
-- **CTAPHID kernels — differentially tested.** All three directions
-  byte-identical to the shipping Rust implementations over the spec vectors
-  and more than 1.5 million seeded random frames (deepest run: 750 k frames).
-  The oracle links the shipping `rsk-usb` `Reassembler` / `TxFrames` /
-  `CidAllocator` + `init_capabilities` + `rsk_sdk::FIRMWARE_VERSION`; the two
-  output streams must `cmp` clean. The INIT allocator's wrap rule is the one
-  piece pinned by spec vectors rather than the differential (the oracle's
-  counter cannot be seeded near the wrap boundary).
+- **CTAPHID kernels — differentially tested.** All five kernels byte-identical
+  to the shipping Rust implementations over the spec vectors and more than
+  two million seeded random frames cumulatively (deepest single run:
+  750 k frames). The oracle links the shipping `rsk-usb` `Reassembler`,
+  `TxFrames`, `CidAllocator`, `init_capabilities`, `keepalive_status`,
+  `is_cancel_frame`, `ChannelLock` and `rsk_sdk::FIRMWARE_VERSION`; the two
+  output streams must `cmp` clean. Two pieces are spec-pinned rather than
+  differential (both cited in-source): the INIT allocator's wrap rule (the
+  oracle's counter cannot be seeded near the wrap boundary) and the lock's
+  `LOCK_MAX_SECONDS` clamp (it lives in the shipping dispatcher, above the
+  twin'd `arm`/`refuses`).
 - **USB driver — verified against a MODEL.** The SIE model is derived from the
   datasheet, with write-to-clear behaviour and explicit host-driven EP1 OUT
   delivery. Green here means datasheet-model agreement only — real-silicon
@@ -104,9 +108,9 @@ Fails if a wrong-register poll would hang the driver (guarded by `timeout 60`).
 
 ## Not here yet
 
-- **Transport-level CTAPHID beyond framing and INIT**: keepalive/cancel
-  handling, the busy-channel lock, error responders for malformed
-  transactions. The kernels here cover reassembly, framing and allocation;
-  the `CtapHid` orchestration around them is not twin'd.
+- **The dispatcher layer**: the `LOCK_MAX_SECONDS` clamp, the keepalive
+  streaming cadence (`KEEPALIVE_MS`), and the cancel-during-up-pending gating
+  are orchestration above the twin'd predicates — a later milestone if the
+  track continues toward a bootable transport.
 - **Hardware bring-up.** The USB driver is model-tested; nothing here has run
   against real silicon.
