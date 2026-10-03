@@ -17,10 +17,11 @@ CFLAGS="-mcpu=cortex-m33 -mthumb -mfloat-abi=soft -ffreestanding -fno-builtin -n
 arm-none-eabi-gcc $CFLAGS -c difftest.S -o "$OUT/difftest-s.o"
 arm-none-eabi-gcc $CFLAGS -c ctaphid.S -o "$OUT/ctaphid.o"
 arm-none-eabi-gcc $CFLAGS -c ctaphid_tx.S -o "$OUT/ctaphid-tx.o"
+arm-none-eabi-gcc $CFLAGS -c ctaphid_init.S -o "$OUT/ctaphid-init.o"
 arm-none-eabi-gcc $CFLAGS -c usb.S -o "$OUT/usb.o"
 arm-none-eabi-gcc $CFLAGS -Os -c usbtest.c -o "$OUT/usbtest-c.o"
 arm-none-eabi-gcc -nostdlib -static -Wl,--build-id=none -e _start \
-    -o "$OUT/usbtest.elf" "$OUT/usb.o" "$OUT/ctaphid.o" "$OUT/ctaphid-tx.o" "$OUT/difftest-s.o" "$OUT/usbtest-c.o"
+    -o "$OUT/usbtest.elf" "$OUT/usb.o" "$OUT/ctaphid.o" "$OUT/ctaphid-tx.o" "$OUT/ctaphid-init.o" "$OUT/difftest-s.o" "$OUT/usbtest-c.o"
 arm-none-eabi-objdump -d "$OUT/usbtest.elf" > "$OUT/usbtest.disasm"
 arm-none-eabi-size "$OUT/usbtest.elf"
 

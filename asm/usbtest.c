@@ -57,9 +57,32 @@
 /* tx state (asm/ctaphid_tx.S layout) */
 #define CTAPHID_TX_STATE 28
 
+/* init exchange (asm/ctaphid_init.S + asm/ctaphid_tx.S layouts) */
+#define CTAPHID_INIT_STATE 4
+#define INIT_DATA 7          /* INIT report payload offset (asm/ctaphid_tx.S) */
+#define INIT_NONCE_LEN 8     /* nonce field        (asm/ctaphid_init.S)        */
+#define INIT_CID_OFF  8      /* newcid[4 LE]      (asm/ctaphid_init.S)         */
+#define INIT_IFACE_OFF 12    /* interface version (asm/ctaphid_init.S)         */
+#define INIT_VER_OFF  13     /* major/minor/build (+0/+1/+2)                   */
+#define INIT_CAPS_OFF 16     /* capability bits   (asm/ctaphid_init.S)         */
+#define INIT_RESP_LEN 17     /* full reply length                              */
+#define INIT_IFACE 2         /* CTAPHID_IF_VERSION                             */
+#define INIT_MAJ 5           /* CI_VERSION_MAJOR                               */
+#define INIT_MIN 8           /* CI_VERSION_MINOR                               */
+#define INIT_BLD 0           /* CI_VERSION_BUILD                               */
+#define CAP_LOCK 0x02        /* capability bits (§11.2.9.3)                    */
+#define CAP_CBOR 0x04
+#define CAPS_NOWINK 0x06     /* CAP_LOCK|CAP_CBOR: no display in this model    */
+#define INIT_BROADCAST_CID 0xffffffffu
+#define INIT_CMD 0x86        /* allocation command (CTAP2.1 §11.2.9.4)         */
+
 extern void usb_init(void);
 extern void usb_task(void);
 extern void usb_send_ep1(const unsigned char *buf, unsigned len);
+extern void ctaphid_init_init(unsigned *state);
+extern unsigned ctaphid_init_run(unsigned *state, const unsigned char *nonce,
+                                 unsigned nonce_len, unsigned can_wink,
+                                 unsigned char *out17);
 extern void ctaphid_tx_init(unsigned *state, unsigned cid, unsigned char cmd,
                             const unsigned char *data, unsigned len);
 extern unsigned ctaphid_tx_next(unsigned *state, unsigned char *out);
@@ -527,6 +550,94 @@ int harness_main(void)
     CHECK(nframes == 3, "e2e interleave frame count 3");
     CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "e2e interleave rx still settled");
     CHECK(ctaphid_state[CS_CID] == 0x0BAD5EEDu, "e2e interleave rx cid holds new channel");
+
+    /* ---- E2E: INIT allocation (CTAP2.1 §11.2.9.1.3/§11.2.9.4) — the full
+     * exchange: broadcast INIT demand -> reassembler done -> allocation
+     * kernel -> TX kernel -> EP1 IN -> model host reads the reply. The
+     * reply to a broadcast INIT is itself broadcast. ---- */
+    unsigned char initst[CTAPHID_INIT_STATE];
+    /* the caller-owned next_cid the allocation kernel persists in
+     * (asm/ctaphid_init.S state layout) */
+    ctaphid_init_init((unsigned *)initst);
+
+    /* (i) broadcast INIT demand: cid 0xffffffff may only carry 0x86, and the
+     * reassembler must complete it on the nonce */
+    unsigned char nonce1[INIT_NONCE_LEN] = {
+        0xA0, 0x14, 0x62, 0x7B, 0xC5, 0x08, 0x3D, 0xE1
+    };
+    ctaphid_packet(pkt, INIT_BROADCAST_CID, 1, INIT_CMD, INIT_NONCE_LEN,
+                   nonce1, INIT_NONCE_LEN);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "init e2e request done");
+    CHECK((unsigned)ctaphid_state[CS_EV_CMD] == (unsigned)INIT_CMD, "init e2e cmd 0x86");
+    CHECK(msg_matches(nonce1, INIT_NONCE_LEN), "init e2e nonce reassembled");
+    CHECK(ctaphid_state[CS_CUR] == INIT_NONCE_LEN, "init e2e length");
+
+    /* (ii) the allocation kernel composes the 17-byte reply into the caller's
+     * buffer; the TX kernel frames it, the model host reads it out of DPRAM.
+     * The field asserts below make a layout corruption visible even if the
+     * whole-copy above is clean */
+    unsigned char resp17[INIT_RESP_LEN];
+    CHECK(ctaphid_init_run((unsigned *)initst, nonce1, INIT_NONCE_LEN, 0, resp17) == 1,
+          "init e2e run ok");
+    ctaphid_tx_init((unsigned *)txst, INIT_BROADCAST_CID, INIT_CMD, resp17, INIT_RESP_LEN);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "init e2e tx frame 1");
+    CHECK(send_and_read_ep1_in(frame), "init e2e dpram == tx frame");
+    CHECK(frame[0] == 0xff && frame[1] == 0xff && frame[2] == 0xff &&
+          frame[3] == 0xff, "init reply broadcast cid");
+    CHECK(frame[4] == INIT_CMD, "init reply type 0x86");
+    CHECK(frame[5] == 0 && frame[6] == INIT_RESP_LEN, "init reply bcnt 17");
+    /* report payload = INIT_DATA + reply offset */
+    for (int i = 0; i < INIT_NONCE_LEN; i++)
+        CHECK(frame[INIT_DATA + i] == nonce1[i], "init reply nonce echo");
+    CHECK(frame[INIT_DATA + INIT_CID_OFF + 0] == 0x00 &&
+          frame[INIT_DATA + INIT_CID_OFF + 1] == 0x00 &&
+          frame[INIT_DATA + INIT_CID_OFF + 2] == 0x00 &&
+          frame[INIT_DATA + INIT_CID_OFF + 3] == 0x01,
+          "init reply first cid 0x01000000");
+    CHECK(frame[INIT_DATA + INIT_IFACE_OFF] == INIT_IFACE, "init reply iface 2");
+    CHECK(frame[INIT_DATA + INIT_VER_OFF + 0] == INIT_MAJ &&
+          frame[INIT_DATA + INIT_VER_OFF + 1] == INIT_MIN &&
+          frame[INIT_DATA + INIT_VER_OFF + 2] == INIT_BLD, "init reply version 5.8.0");
+    CHECK(frame[INIT_DATA + INIT_CAPS_OFF] == CAPS_NOWINK, "init reply caps LOCK|CBOR");
+
+    /* (iv, first half) the stored toggle is the pid of the NEXT IN frame:
+     * the interleave echo's 3 frames since SET_CONFIGURATION left it armed
+     * for DATA1, so this response went out on DATA1 and the toggle is now
+     * armed for DATA0 */
+    CHECK(usb_state[3] == 0, "init e2e toggle armed DATA0 after first response");
+
+    /* (iii) different nonce, same broadcast channel: the counter is caller
+     * state, so it must persist across the whole section */
+    unsigned char nonce2[INIT_NONCE_LEN] = {
+        0x47, 0x39, 0xE6, 0x1C, 0x88, 0xB2, 0x05, 0xA9
+    };
+    ctaphid_packet(pkt, INIT_BROADCAST_CID, 1, INIT_CMD, INIT_NONCE_LEN,
+                   nonce2, INIT_NONCE_LEN);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "init e2e second request done");
+    CHECK(msg_matches(nonce2, INIT_NONCE_LEN), "init e2e second nonce");
+    unsigned char resp17b[INIT_RESP_LEN];
+    CHECK(ctaphid_init_run((unsigned *)initst, nonce2, INIT_NONCE_LEN, 0, resp17b) == 1,
+          "init e2e second run ok");
+    ctaphid_tx_init((unsigned *)txst, INIT_BROADCAST_CID, INIT_CMD, resp17b, INIT_RESP_LEN);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "init second tx frame 1");
+    CHECK(send_and_read_ep1_in(frame), "init second dpram == tx frame");
+    for (int i = 0; i < INIT_NONCE_LEN; i++)
+        CHECK(frame[INIT_DATA + i] == nonce2[i], "init second nonce echo");
+    CHECK(frame[INIT_DATA + INIT_CID_OFF + 0] == 0x01 &&
+          frame[INIT_DATA + INIT_CID_OFF + 1] == 0x00 &&
+          frame[INIT_DATA + INIT_CID_OFF + 2] == 0x00 &&
+          frame[INIT_DATA + INIT_CID_OFF + 3] == 0x01,
+          "init second cid 0x01000001");
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 0, "init e2e tx exhausted");
+
+    /* (iv, second half) the IN data toggle kept alternating through the
+     * two INIT responses: the second went out on DATA0 and the stored
+     * toggle is armed back on DATA1 */
+    CHECK(usb_state[3] == 1, "init e2e toggle armed DATA1 after 2 responses");
 
     say(fails ? "USB MODEL TESTS: FAILED\n" : "USB MODEL TESTS: PASSED\n");
     return fails;

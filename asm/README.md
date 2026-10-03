@@ -32,7 +32,7 @@ here. No file here is linked into a firmware binary.
 | `gen_random.py` | Seeded random frames for the fuzz differential: `noise` (uniform garbage around the framing), `mixed` (valid transactions with noise interleaved on live state), `tx` (random response-framing and INIT-allocation lines) and `ctrl` (random keepalive/cancel/lock lines, including expiry-crossing `now_ms` sequences). |
 | `oracle/` | Rust differential oracle over rsk-usb's `Reassembler` and `TxFrames` — the **shipping** implementations. A detached cargo workspace (the `tools/emu` pattern); links `rsk-usb` from `../../crates/rsk-usb` for host execution only. |
 | `usb.S` | USB device-side driver for the RP2350 USBCTRL block: chapter-9 EP0 control transfers (device/config/string/report descriptors) plus the EP1 interrupt endpoints that carry CTAPHID. Plain MMIO, one event per `usb_task`; register facts cite pico-sdk 2.2.0 headers. |
-| `usbtest.c` | Model-level USB harness: maps the USBCTRL register file + DPSRAM as plain memory under qemu-user and runs the driver against a datasheet-derived SIE model. Includes an end-to-end echo: host frames in via EP1 OUT → reassembly → TX framing → `usb_send_ep1` → the model host reads the frames back out of EP1 IN DPRAM, byte-compared against the kernel output. |
+| `usbtest.c` | Model-level USB harness: maps the USBCTRL register file + DPSRAM as plain memory under qemu-user and runs the driver against a datasheet-derived SIE model. Includes end-to-end exchanges: a CTAPHID echo through both EP1 endpoints, and the INIT transaction (broadcast demand → allocation → reply field-checked: nonce echo, assigned cid, iface, versions, capabilities). |
 | `usbtest.sh` | Builds `usb.S` + the SIE-model harness into a static ARM ELF and runs it under `qemu-arm`. |
 
 ## Running it
@@ -76,24 +76,27 @@ into `ctaphid.S` reassemble to the original payload (verified at the
 QEMU=... nix develop -c ./asm/usbtest.sh
 ```
 
-112 checks: chapter-9 EP0 enumeration (device/config/HID-report/string
+151 checks: chapter-9 EP0 enumeration (device/config/HID-report/string
 descriptors, wLength clamp, SET_ADDRESS latch + §9.6.2 overflow stall,
 GET_STATUS/interface, unknown-request stall, bus-reset address/pid clearing),
 the EP1 CTAPHID data path (single/multi-packet, out-of-sequence abort,
-short-packet tail zeroing, IN data-toggle tracking), and an end-to-end echo
+short-packet tail zeroing, IN data-toggle tracking), an end-to-end echo
 through both EP1 endpoints (request in → reassembly → TX framing → DPRAM
-byte-compare, multi-frame with seq + toggle tracking, interleaved channels).
+byte-compare, multi-frame with seq + toggle tracking, interleaved channels),
+and the INIT transaction end to end (broadcast demand, nonce echo, sequential
+cid allocation, reply fields independently asserted).
 Fails if a wrong-register poll would hang the driver (guarded by `timeout 60`).
 
 ## Verification status
 
 - **CTAPHID kernels — differentially tested.** All five kernels byte-identical
-  to the shipping Rust implementations over the spec vectors and more than
-  two million seeded random frames cumulatively (deepest single run:
-  750 k frames). The oracle links the shipping `rsk-usb` `Reassembler`,
-  `TxFrames`, `CidAllocator`, `init_capabilities`, `keepalive_status`,
-  `is_cancel_frame`, `ChannelLock` and `rsk_sdk::FIRMWARE_VERSION`; the two
-  output streams must `cmp` clean. Two pieces are spec-pinned rather than
+  to the shipping Rust implementations over the spec vectors and nearly four
+  million seeded random frames cumulatively (deepest single runs: 750 k and
+  1 M frames; the transport-control expiry boundary is mutation-verified —
+  flipping the strict `<` to `<=` is caught by the differential). The oracle
+  links the shipping `rsk-usb` `Reassembler`, `TxFrames`, `CidAllocator`,
+  `init_capabilities`, `keepalive_status`, `is_cancel_frame`, `ChannelLock`
+  and `rsk_sdk::FIRMWARE_VERSION`; the two output streams must `cmp` clean. Two pieces are spec-pinned rather than
   differential (both cited in-source): the INIT allocator's wrap rule (the
   oracle's counter cannot be seeded near the wrap boundary) and the lock's
   `LOCK_MAX_SECONDS` clamp (it lives in the shipping dispatcher, above the
