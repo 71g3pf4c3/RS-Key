@@ -244,6 +244,91 @@ lrefuse("still nothing refused", LOTH, 0x81, 1500)
 larm("non-monotonic now: arm owner 2s", LOWN, 2, 1000)
 lrefuse("refuse at an earlier now still respects the lock", LOTH, 0x81, 500)
 
+# dispatcher verdicts (M9): "Q <can_wink 0|1> <cmd 2-hex> <cid 8-hex> <body-hex>"
+# -> "Q <code 2-hex>" (00 = route/no-transport-response, else the error code);
+# an immediate error verdict also frames CTAPHID_ERROR through tx. The lock
+# guard consults the persistent lock + the L branch's clock. Provenance: the
+# wink row is pinned by wink_is_refused_where_the_capability_bit_is_clear; the
+# lock len!=1 / >10 and empty-CBOR rows are spec-claimed (shipping dispatch
+# ctaphid.rs:674-689, 714-717); the unknown and lock-guard rows are doc/run-time
+# pinned (dispatch falls through to ERR_INVALID_CMD, on_frame guards Messages).
+
+CLI = 0x55556666  # a cid reserved for the LOCK sweep's arm side-effects
+
+
+def qcase(name, can_wink, cmd, cid, body):
+    frames.append("# dispatch: " + name)
+    # an empty body omits the field entirely (as the T line's empty payload);
+    # a bare trailing space would be trimmed and read back as a missing field
+    hex = body.hex()
+    frames.append("Q {} {:02x} {:08x}{}".format(can_wink, cmd & 0xFF, cid, (" " + hex) if hex else ""))
+
+
+# LOCK sweep: secs {0,1,9,10,11,255} x body-len {0,1,2}. len!=1 -> INVALID_LEN;
+# len 1 with secs>10 -> INVALID_PAR; else arm (Q 00, the empty LOCK reply).
+for secs in (0, 1, 9, 10, 11, 255):
+    qcase("lock len0 secs={}".format(secs), 0, 0x84, CLI, b"")
+    qcase("lock len1 secs={}".format(secs), 0, 0x84, CLI, bytes([secs]))
+    qcase("lock len2 secs={}".format(secs), 0, 0x84, CLI, bytes([secs, 0xAB]))
+
+# drop the sweep's leftover lock (owner CLI, expiry 0..10 s) so the routing
+# vectors below see a fresh channel; clock returns to 0 with it
+frames.append("# dispatch: release the sweep's lock before the routes")
+frames.append("L arm {:08x} 0 0".format(CLI))
+
+# WINK: can_wink gates the command (test-pinned).
+qcase("wink without an indicator is refused", 0, 0x88, LOWN, b"")
+qcase("wink with an indicator answers empty", 1, 0x88, LOWN, b"")
+
+# MSG/CBOR routing: MSG routes with any body; only an empty CBOR refuses.
+# MSG is 0x83 (ctaphid.rs:32, TYPE_INIT|0x03), not the spec's 0x87 — which
+# this firmware therefore answers as an unknown command.
+qcase("msg empty routes", 0, 0x83, LOWN, b"")
+qcase("msg non-empty routes", 0, 0x83, LOWN, b"\x05\x06")
+qcase("the spec's 0x87 msg byte is unknown here", 0, 0x87, LOWN, b"\x01")
+qcase("cbor non-empty routes", 0, 0x90, LOWN, b"\x00\xa1\x01\x02")
+qcase("cbor empty refused as invalid len", 0, 0x90, LOWN, b"")
+
+# PING echoes its body (a route here; the echo is harness-level).
+qcase("ping with a body routes", 0, 0x81, LOWN, b"\xde\xad\xbe\xef")
+
+# unknown command -> INVALID_CMD.
+qcase("unknown command refused", 0, 0x9F, LOWN, b"")
+
+# CANCEL is never acknowledged, never errored, in any state; no F-lines either.
+qcase("cancel with nothing in flight", 0, 0x91, LOWN, b"")
+qcase("cancel carries a body too, still silent", 0, 0x91, LOWN, b"\x01\x02")
+
+# lock guard on a completed routing message (row 5). arm owner 2s at 1000 ->
+# until=3000; Q uses the L branch's clock so a refuse line advances it.
+# (INIT is not a Q case: the shipping dispatcher routes it before this table,
+# and its broadcast carve-out is already pinned by the L lines above.)
+larm("guard: owner locks 2s", LOWN, 2, 1000)
+qcase("guard cbor on a stranger is channel-busy", 0, 0x90, LOTH, b"\x00\xa1")
+qcase("guard cbor on the owner routes", 0, 0x90, LOWN, b"\x00\xa1")
+qcase("guard ping on a stranger is channel-busy", 0, 0x81, LOTH, b"\x01")
+qcase("guard msg on a stranger is channel-busy", 0, 0x83, LOTH, b"\x02")
+lrefuse("advance the clock to just before expiry", LOWN, 0x81, 2999)
+qcase("still busy at 2999", 0, 0x90, LOTH, b"\x00")
+lrefuse("advance the clock past expiry", LOWN, 0x81, 3001)
+qcase("unblocked at 3001", 0, 0x90, LOTH, b"\x00")
+
+# malformed Q-lines: both sides must X-parse identically
+frames.append("# malformed: q can_wink not 0/1 X-parses")
+frames.append("Q 2 90 {:08x} aa".format(LOWN))
+frames.append("# malformed: q cmd not 2 hex X-parses")
+frames.append("Q 0 9 {:08x} aa".format(LOWN))
+frames.append("# malformed: q cid short of 8 hex X-parses")
+frames.append("Q 0 90 1122 aa")
+frames.append("# malformed: q odd-length body X-parses")
+frames.append("Q 0 90 {:08x} a".format(LOWN))
+frames.append("# malformed: q non-hex body byte X-parses")
+frames.append("Q 0 90 {:08x} zz".format(LOWN))
+frames.append("# malformed: q missing the cid+body fields X-parses")
+frames.append("Q 0 90")
+frames.append("# malformed: q extra trailing field X-parses")
+frames.append("Q 0 90 {:08x} aa 02".format(LOWN))
+
 # malformed control lines: both sides must X-parse identically
 frames.append("# malformed: cancel n out of range (65) X-parses")
 frames.append("C {} 65 {:08x}".format(cframe(LOWN, 0x91).hex(), LOWN))

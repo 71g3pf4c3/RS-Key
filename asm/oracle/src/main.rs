@@ -3,7 +3,9 @@
 
 use rsk_usb::ctaphid::{
     init_capabilities, is_cancel_frame, keepalive_status, ChannelLock, CidAllocator, Outcome,
-    Reassembler, TxFrames, CTAPHID_IF_VERSION, HID_RPT_SIZE,
+    Reassembler, TxFrames, CTAPHID_CANCEL, CTAPHID_CBOR, CTAPHID_ERROR, CTAPHID_LOCK,
+    CTAPHID_MSG, CTAPHID_PING, CTAPHID_WINK, CTAPHID_IF_VERSION, ERR_CHANNEL_BUSY,
+    ERR_INVALID_CMD, ERR_INVALID_LEN, ERR_INVALID_PAR, LOCK_MAX_SECONDS, HID_RPT_SIZE,
 };
 use std::io::Read;
 
@@ -30,6 +32,7 @@ fn main() {
     let mut re = Reassembler::new();
     let mut allocator = CidAllocator::new();
     let mut lock = ChannelLock::default();
+    let mut clock_now: u64 = 0; // clock for Q lock guards; advanced by L lines
     let mut out = String::new();
 
     for line in input.lines() {
@@ -158,7 +161,10 @@ fn main() {
                     let secs = secs_s.parse::<u32>().ok().filter(|s| *s <= 255);
                     let now = now_s.parse::<u64>().ok();
                     match (cid, secs, now) {
-                        (Ok(c), Some(s), Some(n)) => lock.arm(c, s as u8, n),
+                        (Ok(c), Some(s), Some(n)) => {
+                            clock_now = n;
+                            lock.arm(c, s as u8, n)
+                        }
                         _ => {
                             out.push_str("X parse\n");
                         }
@@ -169,7 +175,10 @@ fn main() {
                     let cmd = u8::from_str_radix(cmd_s, 16);
                     let now = now_s.parse::<u64>().ok();
                     let r = match (cid, cmd, now) {
-                        (Ok(c), Ok(m), Some(n)) => lock.refuses(c, m, n),
+                        (Ok(c), Ok(m), Some(n)) => {
+                            clock_now = n;
+                            lock.refuses(c, m, n)
+                        }
                         _ => {
                             out.push_str("X parse\n");
                             continue;
@@ -181,6 +190,89 @@ fn main() {
                     out.push_str("X parse\n");
                 }
             }
+            continue;
+        }
+
+        // dispatcher verdicts (M9): "Q <can_wink 0|1> <cmd 2hex> <cid 8hex>
+        // [body-hex]" -> "Q <code 2hex>" (00 = route/no-transport-response,
+        // else the error code); an immediate error verdict also frames
+        // CTAPHID_ERROR through TxFrames. A missing body field is the empty
+        // body (the line trim swallows a bare empty 4th field), mirroring how
+        // this harness models T's bare-INIT empty payload. This is the Rust
+        // mirror of the table in asm/ctaphid_dispatch.S; provenance per row:
+        //   wink:        pinned by wink_is_refused_where_the_capability_bit_is_clear.
+        //   lock:        <=10 arm + empty-LOCK reply are the shipping dispatch's
+        //                code path; len!=1 / >10 are spec-claimed (no unit pins).
+        //   empty CBOR:  spec-claimed (dispatch ctaphid.rs:714-717).
+        //   lock guard:  the shipping on_frame guards every Message with
+        //                lock.refuses -> ERR_CHANNEL_BUSY (doc-pinned, and the
+        //                same refuses the twin'd ctaphid_lock_refuses).
+        if let Some(rest) = l.strip_prefix("Q ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            // empty body = the 3-field line; a body occupies the 4th field
+            let (w, cmd_s, cid_s, body_s) = match parts.as_slice() {
+                [w, cmd_s, cid_s] if w.len() == 1 && (*w == "0" || *w == "1")
+                    && cmd_s.len() == 2 && cid_s.len() == 8 => (*w, *cmd_s, *cid_s, ""),
+                [w, cmd_s, cid_s, body_s] if w.len() == 1 && (*w == "0" || *w == "1")
+                    && cmd_s.len() == 2 && cid_s.len() == 8 => {
+                    (*w, *cmd_s, *cid_s, *body_s)
+                }
+                _ => {
+                    out.push_str("X parse\n");
+                    continue;
+                }
+            };
+            let can_wink = w == "1";
+            let cmd = u8::from_str_radix(cmd_s, 16).ok();
+            let cid = u32::from_str_radix(cid_s, 16).ok();
+            let body = parse_hex(body_s);
+            let build = match (cmd, cid, body) {
+                (Some(c), Some(ci), Some(b)) if b.len() <= TX_CAP => {
+                    let (code, err) = match c {
+                        CTAPHID_CANCEL => (0x00, false), // never acknowledged
+                        CTAPHID_PING | CTAPHID_MSG | CTAPHID_CBOR => {
+                            if lock.refuses(ci, c, clock_now) {
+                                (ERR_CHANNEL_BUSY, true)
+                            } else if c == CTAPHID_CBOR && b.is_empty() {
+                                (ERR_INVALID_LEN, true)
+                            } else {
+                                (0x00, false) // route
+                            }
+                        }
+                        CTAPHID_LOCK => {
+                            if b.len() != 1 {
+                                (ERR_INVALID_LEN, true)
+                            } else if b[0] > LOCK_MAX_SECONDS {
+                                (ERR_INVALID_PAR, true)
+                            } else {
+                                lock.arm(ci, b[0], clock_now);
+                                (0x00, false) // arm; no reply-from-here
+                            }
+                        }
+                        CTAPHID_WINK => {
+                            if can_wink {
+                                (0x00, false) // empty wink reply
+                            } else {
+                                (ERR_INVALID_CMD, true)
+                            }
+                        }
+                        _ => (ERR_INVALID_CMD, true), // unknown command
+                    };
+                    let mut s = format!("Q {:02x}\n", code);
+                    if err {
+                        for fr in TxFrames::new(ci, CTAPHID_ERROR, &[code]) {
+                            s.push_str("F ");
+                            for byte in fr {
+                                s.push_str(&format!("{:02x}", byte));
+                            }
+                            s.push('\n');
+                        }
+                    }
+                    s
+                }
+                _ => "X parse\n".to_string(),
+            };
+            out.push_str(&build);
             continue;
         }
 

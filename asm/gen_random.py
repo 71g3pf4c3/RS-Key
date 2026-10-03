@@ -19,6 +19,10 @@ ctrl:  transport-control lines — "K is_cbor up_pending" keepalive, "C frame
         with random lock times (0..10 s and occasionally past the dispatcher's
         LOCK_MAX_SECONDS clamp, which neither side may apply) and now_ms drift
         that crosses lock expiry.
+dispatch: dispatcher-verdict lines — "Q can_wink cmd cid body" over random
+        commands/cids/bodies, with the passive lock pre-armed so a share of the
+        routing commands land on a refused channel; the cannot-acknowledge
+        CANCEL and the unknown-command rows are exercised too.
 """
 
 import random
@@ -144,6 +148,47 @@ def ctrl_lines(rng, n):
     return out
 
 
+# 0x83 is this firmware's MSG (TYPE_INIT|0x03, ctaphid.rs:32); 0x87, the
+# FIDO spec's MSG, and the rest are unknown-command bytes
+DISPATCH_CMDS = [0x81, 0x83, 0x87, 0x90, 0x84, 0x88, 0x91, 0x9F, 0x80, 0xC0, 0x3c]
+DISPATCH_OWNER = 0x11223344
+DISPATCH_STRANGER = 0xAABBCCDD
+
+
+def dispatch_lines(rng, n):
+    """Random dispatcher Q-lines. A passive lock is armed up front and other
+    times mid-stream, then routing commands (MSG/CBOR/PING) are sent at up to
+    three cids against it, so the channel-busy guard and its carve-outs get
+    fuzzed; CANCEL must stay silent on any cid."""
+    out = []
+
+    def arm(secs, now):
+        out.append("L arm {:08x} {} {}".format(DISPATCH_OWNER, secs, now))
+
+    def q(can_wink, cmd, cid, body):
+        out.append("Q {} {:02x} {:08x} {}".format(can_wink, cmd & 0xFF, cid, body.hex()))
+
+    arm(5, 1000)
+    for _ in range(n):
+        r = rng.random()
+        cmd = rng.choice(DISPATCH_CMDS)
+        if r < 0.5:
+            cid = rng.choice([DISPATCH_OWNER, DISPATCH_STRANGER, 0xFFFFFFFF, 0x01020304])
+            ln = rng.choice([0, 1, 2, rng.randrange(1, 200)])
+            q(rng.choice(["0", "1"]), cmd, cid, pat(rng, ln))
+        elif r < 0.7:
+            # a lock change: release/re-arm, drifting the clock she can cross
+            secs = rng.choice([0, 5, 10, 11])
+            now = rng.randrange(0, 4_000_000)
+            arm(secs, now)
+        else:
+            # exercise an unknown/cancel command independent of the lock
+            cid = rng.choice([DISPATCH_OWNER, DISPATCH_STRANGER, 0x01020304])
+            q(rng.choice(["0", "1"]), rng.choice([0x91, 0x9F, 0xC0, 0x3c]), cid,
+              pat(rng, rng.choice([0, 1, rng.randrange(1, 64)])))
+    return out
+
+
 def main():
     seed = int(sys.argv[1])
     n = int(sys.argv[2])
@@ -161,6 +206,9 @@ def main():
         return
     if mode == "ctrl":
         print("\n".join(ctrl_lines(rng, n)))
+        return
+    if mode == "dispatch":
+        print("\n".join(dispatch_lines(rng, n)))
         return
     tx = None  # live valid transaction: (cid, payload, off, seq)
     for _ in range(n):

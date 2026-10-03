@@ -45,6 +45,10 @@ extern void ctaphid_init_init(struct init_state *st);
 extern unsigned ctaphid_init_run(struct init_state *st,
                                  const unsigned char *nonce, unsigned nonce_len,
                                  unsigned can_wink, unsigned char *out17);
+extern unsigned ctaphid_lock_command(const unsigned char *body, unsigned len);
+extern unsigned ctaphid_wink(unsigned can_wink);
+extern unsigned ctaphid_msg_guard(unsigned cmd, unsigned len);
+extern unsigned ctaphid_unknown(unsigned cmd);
 extern long sys_read(long fd, void *buf, long n);
 extern long sys_write(long fd, const void *buf, long n);
 
@@ -55,6 +59,9 @@ static struct lock_state lks;
 static unsigned char msgbuf[MSG_CAP];
 static unsigned char paybuf[MSG_CAP];
 static unsigned char tframe[64];
+static unsigned char qbody[MSG_CAP]; /* body slots for the Q dispatch line */
+static unsigned char codebuf[1];
+static unsigned long long cur_now;    /* clock for Q lock guards (last L line) */
 
 /* any real line fits with two orders of magnitude to spare: the longest is
  * a maximum-size T payload at ~15.3 KB */
@@ -65,6 +72,22 @@ static unsigned char inbuf[1 << 20];
 #define RPT_CID     1
 #define RPT_BCNT_HI 5
 #define RPT_BCNT_LO 6
+
+/* CTAPHID command bytes the dispatcher keys on (ctaphid.rs:31-52); MSG is
+ * 0x83 here, not the FIDO spec's 0x87 — the shipping const is TYPE_INIT|0x03
+ * and 0x87 falls to the unknown-command verdict */
+#define CMD_PING   0x81
+#define CMD_LOCK   0x84
+#define CMD_MSG    0x83
+#define CMD_WINK   0x88
+#define CMD_CBOR   0x90
+#define CMD_CANCEL 0x91
+#define CMD_ERROR  0xBF
+/* dispatcher error verdicts, returned as the Q code byte (ctaphid.rs:46-52) */
+#define Q_INVALID_CMD  0x01
+#define Q_INVALID_PAR  0x02
+#define Q_INVALID_LEN  0x03
+#define Q_CHANNEL_BUSY 0x06
 
 static int hexval(char c)
 {
@@ -380,6 +403,7 @@ static void process_line(unsigned char *p, unsigned char *eol)
             }
             now_lo = (unsigned)now;
             now_hi = (unsigned)(now >> 32);
+            cur_now = now; /* Q lock guards share the L branch's clock */
             ctaphid_lock_arm(&lks, cid, secs, now_lo, now_hi);
             return; /* arm emits nothing; the lock persists for later lines */
         }
@@ -394,6 +418,7 @@ static void process_line(unsigned char *p, unsigned char *eol)
             }
             now_lo = (unsigned)now;
             now_hi = (unsigned)(now >> 32);
+            cur_now = now; /* Q lock guards share the L branch's clock */
             unsigned r = ctaphid_lock_refuses(&lks, cid, (unsigned)cmd, now_lo, now_hi);
             unsigned char *o = out;
             *o++ = 'R'; *o++ = ' ';
@@ -402,6 +427,86 @@ static void process_line(unsigned char *p, unsigned char *eol)
             return;
         }
         parse_error();
+        return;
+    }
+
+    /* dispatcher verdicts: "Q <can_wink 0|1> <cmd 2-hex> <cid 8-hex> [body-hex]"
+     * -> "Q <code 2-hex>" (00 = route/no-transport-response, else the error
+     * code); an immediate error verdict also frames CTAPHID_ERROR though tx.
+     * A missing body field is the empty body (the trailing-space trim would
+     * swallow a bare empty field), matching the T line's bare-INIT handling.
+     * The lock guard consults the persistent lock + the L branch's clock. */
+    if (*p == 'Q' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        unsigned char cmd, can_wink;
+        unsigned cid, blen = 0;
+        int ok = (nf == 3 || nf == 4) && f[0].len == 1 &&
+                 (f[0].p[0] == '0' || f[0].p[0] == '1') &&
+                 parse_hex_byte(f[1].p, f[1].len, &cmd) &&
+                 parse_hex_u32(f[2].p, f[2].len, &cid);
+        if (ok && nf == 4) {
+            if ((f[3].len & 1) == 0) {
+                blen = f[3].len / 2;
+                if (blen) ok = (blen <= MSG_CAP) && parse_hex_n(f[3].p, f[3].len, qbody);
+            } else {
+                ok = 0;
+            }
+        }
+        if (!ok) {
+            parse_error();
+            return;
+        }
+        can_wink = (unsigned char)(f[0].p[0] - '0');
+        unsigned code = 0x00;
+        int frame = 0;
+        if (cmd == CMD_CANCEL) {
+            /* never acknowledged, never errored, in any state */
+        } else if (cmd == CMD_PING || cmd == CMD_MSG || cmd == CMD_CBOR) {
+            /* the lock guard fires on a refused channel, before any routing */
+            unsigned now_lo = (unsigned)cur_now, now_hi = (unsigned)(cur_now >> 32);
+            if (ctaphid_lock_refuses(&lks, cid, (unsigned)cmd, now_lo, now_hi)) {
+                code = Q_CHANNEL_BUSY; frame = 1;
+            } else if (ctaphid_msg_guard((unsigned)cmd, blen) == 1) {
+                code = Q_INVALID_LEN; frame = 1; /* only an empty CBOR refuses */
+            } else {
+                code = 0x00; /* route */
+            }
+        } else if (cmd == CMD_LOCK) {
+            unsigned r = ctaphid_lock_command(qbody, blen);
+            if (r == 2) { code = Q_INVALID_PAR; frame = 1; }
+            else if (r == 1) { code = Q_INVALID_LEN; frame = 1; }
+            else {
+                /* arm, the caller-side half of the dispatcher's LOCK verdict */
+                unsigned now_lo = (unsigned)cur_now, now_hi = (unsigned)(cur_now >> 32);
+                ctaphid_lock_arm(&lks, cid, qbody[0], now_lo, now_hi);
+                code = 0x00;
+            }
+        } else if (cmd == CMD_WINK) {
+            if (ctaphid_wink((unsigned)can_wink) != 0) { code = Q_INVALID_CMD; frame = 1; }
+            else { code = 0x00; } /* empty wink reply */
+        } else {
+            ctaphid_unknown((unsigned)cmd);
+            code = Q_INVALID_CMD; frame = 1;
+        }
+        unsigned char *o = out;
+        *o++ = 'Q'; *o++ = ' ';
+        o = hex2(o, code);
+        *o++ = '\n';
+        emit(out, o - out);
+        if (frame) {
+            codebuf[0] = (unsigned char)code;
+            ctaphid_tx_init(&txs, cid, CMD_ERROR, codebuf, 1);
+            unsigned n = 0;
+            while (n < 256 && ctaphid_tx_next(&txs, tframe)) {
+                o = out;
+                *o++ = 'F'; *o++ = ' ';
+                o = hexn(o, tframe, 64);
+                *o++ = '\n';
+                emit(out, o - out);
+                n++;
+            }
+        }
         return;
     }
 
