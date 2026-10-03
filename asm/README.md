@@ -19,8 +19,8 @@ here. No file here is linked into a firmware binary.
 | File | What |
 |---|---|
 | `boot.S` | M2 boot image: vector table, reset handler (.data/.bss copy), pad/FUNCSEL + GPIO blink. Publishes a `__image_def` block byte-identical to the shipping `image_def` at `0x10000114` — the pre-`pt.sh`, unpartitioned form. |
-| `link.ld` | M2 memory map: 16 MiB XIP flash window + 520 KiB SRAM. Full region-by-region map with security classification is deferred to M3. |
-| `build.sh` | asm → ELF → `.bin`/`.uf2`, deterministic. Dumps `target/asm/ref.disasm` from the shipping firmware for the audit trail. Requires the `nix develop` devshell (`arm-none-eabi-gcc`, `picotool`). |
+| `link.ld` | M3 memory map, region-for-region with the shipping `firmware/memory.x` default 4 MB layout: code 2560K, `KVMAIN` 1408K, `KVCNT` 128K, RAM 512K — plus the `__kvmain_start`/`__kvcnt_end` fence symbols (the exact spellings `scripts/pt.sh` reads) and ASSERTs that the map is one contiguous 4 MB with the image's own footprint out of the store. |
+| `build.sh` | asm → ELF → `.bin`, then the store fence: the SAME `scripts/pt.sh` the shipping image runs over the SAME symbols, producing the flashable `boot-pt.elf`/`.uf2`. Verifies the emitted table against the symbols (the gate's `partition_table_fences_the_store` row, run against the asm image) and diffs the parsed table against the shipping firmware's — same script, same JSON, same bounds, so they must agree line for line. Deterministic; dumps `target/asm/ref.disasm` for the audit trail. Requires the `nix develop` devshell (`arm-none-eabi-gcc`, `picotool`). |
 | `ctaphid.S` | CTAPHID reassembly kernel (CTAP 2.1 §11.2.9). Pure: no hardware, no allocator; parses host-controlled framing and emits events (busy/done/error/ignored). The differentially tested core. |
 | `ctaphid_tx.S` | CTAPHID transmission framing kernel — the mirror of `ctaphid.S`: splits one outgoing message into 64-byte reports (an INIT then CONTs, always at least the INIT). The `cmd` byte is stored verbatim, matching the shipping `TxFrames` contract. |
 | `ctaphid_init.S` | CTAPHID INIT allocation kernel (CTAP 2.1 §11.2.9.4): a persistent `next_cid` counter plus the 17-byte reply composition (nonce‖newcid LE‖iface‖version‖capabilities). The allocator wrap rule is spec-pinned (cited from the shipping tests); the values are differentially cross-checked against `CidAllocator` + `init_capabilities` + `rsk_sdk::FIRMWARE_VERSION`. |
@@ -50,11 +50,16 @@ store path.
 nix develop -c ./asm/build.sh
 ```
 
-Outputs `target/asm/boot.{elf,bin,uf2}` + `boot.disasm`/`ref.disasm`. The build
-is deterministic: two runs produce byte-identical `.bin` and `.elf` (buried
+Outputs `target/asm/boot.{bin,elf}` (the bare pre-`pt.sh` form) plus
+`boot-pt.{elf,uf2}` (the flashable, fenced image), `boot.disasm`/`ref.disasm`.
+The build is deterministic: two runs produce byte-identical artifacts (buried
 timestamps and build paths are none). The boot image's `__image_def` block
 matches the shipping `image_def` byte-for-byte; `ref.disasm` backs the pad/SIO
-register facts the source cites.
+register facts the source cites. The fence step verifies the emitted table
+against the ELF's own symbols and — when the shipping firmware ELF is present
+— diffs it against the shipping partition table, which it must match exactly:
+same script, same JSON, same 0x280000..0x400000 bounds, NSBOOT denied over the
+store.
 
 ### CTAPHID differential
 
@@ -96,6 +101,14 @@ Fails if a wrong-register poll would hang the driver (guarded by `timeout 60`).
 
 ## Verification status
 
+- **Store fence — differentially identical to the shipping table.** `build.sh`
+  runs the shipping `scripts/pt.sh` over the asm image's own
+  `__kvmain_start`/`__kvcnt_end` symbols and diffs the parsed table against
+  the shipping firmware's: identical, because the layout is region-for-region
+  the same and the script and JSON are literally the same files. Mutation-
+  verified through the build row: decoupling `__kvmain_start` from its region
+  links clean and passes the symbol self-check but is caught by the shipping
+  diff; breaking the map's contiguity is caught by the linker's own ASSERTs.
 - **CTAPHID kernels — differentially tested.** All seven kernels byte-identical
   to the shipping Rust implementations over the spec vectors and over four
   million seeded random frames cumulatively (deepest single runs: 750 k and
