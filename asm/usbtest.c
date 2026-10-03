@@ -76,6 +76,22 @@
 #define INIT_BROADCAST_CID 0xffffffffu
 #define INIT_CMD 0x86        /* allocation command (CTAP2.1 §11.2.9.4)         */
 
+/* dispatcher command bytes (ctaphid.rs:31-52); MSG is 0x83 — TYPE_INIT|0x03,
+ * not the FIDO spec's 0x87 */
+#define CMD_LOCK   0x84
+#define CMD_MSG    0x83
+#define CMD_CBOR   0x90
+#define CMD_CANCEL 0x91
+#define CMD_ERROR  0xBF
+#define CMD_KEEPALIVE 0xBB
+/* dispatcher error codes (ctaphid.rs:46-52) */
+#define ERRCODE_INVALID_CMD  0x01
+#define ERRCODE_INVALID_LEN  0x03
+#define ERRCODE_CHANNEL_BUSY 0x06
+/* keepalive status bytes (ctaphid.rs:55-58) */
+#define KA_PROCESSING 0x01
+#define KA_UPNEEDED   0x02
+
 extern void usb_init(void);
 extern void usb_task(void);
 extern void usb_send_ep1(const unsigned char *buf, unsigned len);
@@ -89,6 +105,25 @@ extern unsigned ctaphid_tx_next(unsigned *state, unsigned char *out);
 extern unsigned usb_state[5];       /* pending, configured, out_pid, in_pid, tx_done */
 extern unsigned ctaphid_state[12];
 extern unsigned char ctaphid_msg[7609];
+
+/* dispatcher verdicts + transport control + worker wait (the asm/ctaphid_
+ * {dispatch,ctrl,wait}.S layouts; the same caller-owned states difftest.c
+ * mirrors) */
+struct lock_state { unsigned cid, until_lo, until_hi; };
+struct wait_state { unsigned active, next_lo, next_hi; };
+extern unsigned ctaphid_lock_command(const unsigned char *body, unsigned len);
+extern unsigned ctaphid_wink(unsigned can_wink);
+extern unsigned ctaphid_msg_guard(unsigned cmd, unsigned len);
+extern void ctaphid_lock_arm(struct lock_state *st, unsigned cid, unsigned secs,
+                             unsigned now_lo, unsigned now_hi);
+extern unsigned ctaphid_lock_refuses(struct lock_state *st, unsigned cid,
+                                     unsigned cmd, unsigned now_lo, unsigned now_hi);
+extern unsigned ctaphid_keepalive_status(unsigned is_cbor, unsigned up_pending);
+extern void ctaphid_wait_start(struct wait_state *st, unsigned now_lo, unsigned now_hi);
+extern unsigned ctaphid_wait_tick(struct wait_state *st, unsigned now_lo, unsigned now_hi);
+extern unsigned ctaphid_wait_frame(unsigned up_pending, const unsigned char *frame,
+                                   unsigned n, unsigned cid);
+extern void ctaphid_wait_finish(struct wait_state *st);
 
 extern long sys_mmap2(long addr, long len, long prot, long flags, long fd, long off);
 extern long sys_write(long fd, const void *buf, long n);
@@ -638,6 +673,148 @@ int harness_main(void)
      * two INIT responses: the second went out on DATA0 and the stored
      * toggle is armed back on DATA1 */
     CHECK(usb_state[3] == 1, "init e2e toggle armed DATA1 after 2 responses");
+
+    /* ---- E2E: the full transport stack — the dispatcher verdicts and the
+     * worker-wait cadence over EP1, the INIT e2e one layer up: host ->
+     * EP1 OUT -> reassembler done -> verdict / cadence -> CTAPHID_ERROR or
+     * CTAPHID_KEEPALIVE or the response, framed through the TX kernel ->
+     * EP1 IN. The lock and wait states are the kernels' caller-owned
+     * structs, exactly as difftest.c drives them. ---- */
+    struct lock_state lks = {0, 0, 0};
+    struct wait_state wst = {0, 0, 0};
+    unsigned lcid = 0xCAFE0001u, ocid = 0xCAFE0002u;
+    unsigned char one[1] = {5};
+
+    /* (a) LOCK arms and answers empty: verdict, arm at now_ms 100, the
+     * zero-length reply is the TX kernel's always-at-least-INIT contract */
+    ctaphid_packet(pkt, lcid, 1, CMD_LOCK, 1, one, 1);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "stack e2e lock request done");
+    CHECK(ctaphid_state[CS_CUR] == 1 && ctaphid_msg[0] == 5, "stack e2e lock body 1 byte, secs 5");
+    CHECK(ctaphid_lock_command(ctaphid_msg, ctaphid_state[CS_CUR]) == 0, "stack e2e lock verdict arm");
+    ctaphid_lock_arm(&lks, lcid, 5, 100, 0);
+    ctaphid_tx_init((unsigned *)txst, lcid, CMD_LOCK, one, 0);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "stack e2e lock reply one INIT frame");
+    CHECK(send_and_read_ep1_in(frame), "stack e2e lock dpram == tx frame");
+    CHECK(frame[0] == 0x01 && frame[1] == 0x00 && frame[2] == 0xfe && frame[3] == 0xca,
+          "stack e2e lock reply cid");
+    CHECK(frame[4] == CMD_LOCK && frame[5] == 0 && frame[6] == 0, "stack e2e lock reply bcnt 0");
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 0, "stack e2e lock tx exhausted");
+    CHECK(usb_state[3] == 0, "stack e2e toggle armed DATA0 after lock reply");
+
+    /* (b) a second host's MSG while locked earns CHANNEL_BUSY; the owner
+     * routes, and at the just-expired instant (now == until, armed 5 s at
+     * now_ms 100) the lock is already gone */
+    ctaphid_packet(pkt, ocid, 1, CMD_MSG, 4, one, 0);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "stack e2e msg request done");
+    CHECK(ctaphid_lock_refuses(&lks, ocid, CMD_MSG, 1000, 0) == 1, "stack e2e lock refuses the second host");
+    CHECK(ctaphid_lock_refuses(&lks, lcid, CMD_CBOR, 1000, 0) == 0, "stack e2e owner routes while locked");
+    CHECK(ctaphid_lock_refuses(&lks, ocid, CMD_CBOR, 5099, 0) == 1, "stack e2e still locked at 5099");
+    CHECK(ctaphid_lock_refuses(&lks, ocid, CMD_CBOR, 5100, 0) == 0, "stack e2e expired at the boundary");
+    one[0] = ERRCODE_CHANNEL_BUSY;
+    ctaphid_tx_init((unsigned *)txst, ocid, CMD_ERROR, one, 1);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "stack e2e busy error one frame");
+    CHECK(send_and_read_ep1_in(frame), "stack e2e busy dpram == tx frame");
+    CHECK(frame[4] == CMD_ERROR && frame[5] == 0 && frame[6] == 1 && frame[7] == ERRCODE_CHANNEL_BUSY,
+          "stack e2e busy error frame 0xbf/06");
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 0, "stack e2e busy tx exhausted");
+
+    /* (c) WINK without an indicator is INVALID_CMD */
+    CHECK(ctaphid_wink(0) == 1, "stack e2e wink refused without an indicator");
+    one[0] = ERRCODE_INVALID_CMD;
+    ctaphid_tx_init((unsigned *)txst, lcid, CMD_ERROR, one, 1);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "stack e2e wink error one frame");
+    CHECK(send_and_read_ep1_in(frame), "stack e2e wink dpram == tx frame");
+    CHECK(frame[4] == CMD_ERROR && frame[7] == ERRCODE_INVALID_CMD, "stack e2e wink error frame 0xbf/01");
+
+    /* (d) an empty CBOR message is INVALID_LEN; the reassembler completes
+     * the zero-bcnt INIT frame, the guard refuses it */
+    ctaphid_packet(pkt, lcid, 1, CMD_CBOR, 0, one, 0);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "stack e2e empty cbor done");
+    CHECK(ctaphid_state[CS_CUR] == 0, "stack e2e empty cbor length 0");
+    CHECK(ctaphid_msg_guard(CMD_CBOR, 0) == 1, "stack e2e empty cbor refused");
+    one[0] = ERRCODE_INVALID_LEN;
+    ctaphid_tx_init((unsigned *)txst, lcid, CMD_ERROR, one, 1);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "stack e2e cbor error one frame");
+    CHECK(send_and_read_ep1_in(frame), "stack e2e cbor dpram == tx frame");
+    CHECK(frame[4] == CMD_ERROR && frame[7] == ERRCODE_INVALID_LEN, "stack e2e cbor error frame 0xbf/03");
+
+    /* (e) a CBOR request enters the worker wait: one keepalive per 100 ms
+     * deadline, PROCESSING off the touch wait and UPNEEDED on it, both out
+     * EP1 IN */
+    unsigned char cborbody[4] = {0x01, 0xA2, 0x03, 0xB4};
+    ctaphid_packet(pkt, lcid, 1, CMD_CBOR, 4, cborbody, 4);
+    host_send_ep1(pkt, 64);
+    pump(2);
+    CHECK(ctaphid_state[CS_EV_TAG] == EV_DONE, "stack e2e wait request done");
+    CHECK(ctaphid_msg_guard(CMD_CBOR, ctaphid_state[CS_CUR]) == 0, "stack e2e wait cbor routes");
+    ctaphid_wait_start(&wst, 0, 0);
+    CHECK(ctaphid_wait_tick(&wst, 50, 0) == 0, "stack e2e nothing before the deadline");
+    CHECK(ctaphid_wait_tick(&wst, 100, 0) == 1, "stack e2e deadline due");
+    CHECK(ctaphid_keepalive_status(1, 0) == KA_PROCESSING, "stack e2e processing status");
+    one[0] = KA_PROCESSING;
+    ctaphid_tx_init((unsigned *)txst, lcid, CMD_KEEPALIVE, one, 1);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "stack e2e ka processing one frame");
+    CHECK(send_and_read_ep1_in(frame), "stack e2e ka processing dpram == tx frame");
+    CHECK(frame[4] == CMD_KEEPALIVE && frame[5] == 0 && frame[6] == 1 && frame[7] == KA_PROCESSING,
+          "stack e2e ka frame 0xbb/01");
+    CHECK(ctaphid_wait_tick(&wst, 100, 0) == 0, "stack e2e next deadline not due yet");
+    CHECK(ctaphid_wait_tick(&wst, 200, 0) == 1, "stack e2e second deadline due");
+    CHECK(ctaphid_keepalive_status(1, 1) == KA_UPNEEDED, "stack e2e upneeded status");
+    one[0] = KA_UPNEEDED;
+    ctaphid_tx_init((unsigned *)txst, lcid, CMD_KEEPALIVE, one, 1);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "stack e2e ka upneeded one frame");
+    CHECK(send_and_read_ep1_in(frame), "stack e2e ka upneeded dpram == tx frame");
+    CHECK(frame[4] == CMD_KEEPALIVE && frame[7] == KA_UPNEEDED, "stack e2e ka frame 0xbb/02");
+
+    /* (f) the touch goes pending: a CANCEL on the waiting channel signals
+     * the worker, one on a foreign channel is dropped; the raw frames go
+     * straight to the wait window — the driver never reassembles them, so
+     * no pump runs and the OUT buffer is consumed by the watch read,
+     * exactly the firmware's reader split */
+    unsigned char watch[64];
+    ctaphid_packet(pkt, ocid, 1, CMD_CANCEL, 0, one, 0);
+    host_send_ep1(pkt, 64);
+    for (int i = 0; i < 64; i++) watch[i] = EP1_OUT_BUF(i);
+    BC1_OUT &= ~(BC_FULL | 0x3ffu);
+    buff_shadow &= ~8u;
+    CHECK(ctaphid_wait_frame(1, watch, 64, lcid) == 1, "stack e2e foreign cancel drops");
+    ctaphid_packet(pkt, lcid, 1, CMD_CANCEL, 0, one, 0);
+    host_send_ep1(pkt, 64);
+    for (int i = 0; i < 64; i++) watch[i] = EP1_OUT_BUF(i);
+    BC1_OUT &= ~(BC_FULL | 0x3ffu);
+    buff_shadow &= ~8u;
+    CHECK(ctaphid_wait_frame(1, watch, 64, lcid) == 2, "stack e2e own cancel signals");
+    CHECK(ctaphid_wait_frame(0, watch, 64, lcid) == 0, "stack e2e off the touch wait it queues");
+
+    /* (g) the worker answers the cancelled touch with CTAP2_ERR_KEEPALIVE_
+     * CANCEL in the CBOR response; the wait ends and the cadence with it */
+    ctaphid_wait_finish(&wst);
+    CHECK(ctaphid_wait_tick(&wst, 9999, 0) == 0, "stack e2e finished wait never due");
+    one[0] = 0x2d; /* CTAP2_ERR_KEEPALIVE_CANCEL (rsk-fido/src/error.rs:31) */
+    ctaphid_tx_init((unsigned *)txst, lcid, CMD_CBOR, one, 1);
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 1, "stack e2e response one frame");
+    CHECK(send_and_read_ep1_in(frame), "stack e2e response dpram == tx frame");
+    CHECK(frame[4] == CMD_CBOR && frame[7] == 0x2d, "stack e2e response 0x90/0x2d");
+    CHECK(ctaphid_tx_next((unsigned *)txst, frame) == 0, "stack e2e response tx exhausted");
+
+    /* (h) a U2F fast op stays silent: the deadline is due but the status
+     * is None, so nothing goes out EP1 IN */
+    ctaphid_wait_start(&wst, 0, 0);
+    CHECK(ctaphid_wait_tick(&wst, 100, 0) == 1, "stack e2e u2f deadline due");
+    CHECK(ctaphid_keepalive_status(0, 0) == 0, "stack e2e u2f fast op stays silent");
+    ctaphid_wait_finish(&wst);
+
+    /* the whole section sent seven IN frames since the INIT pair left the
+     * toggle armed DATA1: lock reply, busy error, wink error, cbor error,
+     * two keepalives, the response — an odd count, so the toggle is armed
+     * back on DATA0 */
+    CHECK(usb_state[3] == 0, "stack e2e toggle armed DATA0 after seven IN frames");
 
     say(fails ? "USB MODEL TESTS: FAILED\n" : "USB MODEL TESTS: PASSED\n");
     return fails;
