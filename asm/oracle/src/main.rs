@@ -5,7 +5,8 @@ use rsk_usb::ctaphid::{
     init_capabilities, is_cancel_frame, keepalive_status, ChannelLock, CidAllocator, Outcome,
     Reassembler, TxFrames, CTAPHID_CANCEL, CTAPHID_CBOR, CTAPHID_ERROR, CTAPHID_LOCK,
     CTAPHID_MSG, CTAPHID_PING, CTAPHID_WINK, CTAPHID_IF_VERSION, ERR_CHANNEL_BUSY,
-    ERR_INVALID_CMD, ERR_INVALID_LEN, ERR_INVALID_PAR, LOCK_MAX_SECONDS, HID_RPT_SIZE,
+    ERR_INVALID_CMD, ERR_INVALID_LEN, ERR_INVALID_PAR, KEEPALIVE_MS, LOCK_MAX_SECONDS,
+    HID_RPT_SIZE,
 };
 use std::io::Read;
 
@@ -33,6 +34,10 @@ fn main() {
     let mut allocator = CidAllocator::new();
     let mut lock = ChannelLock::default();
     let mut clock_now: u64 = 0; // clock for Q lock guards; advanced by L lines
+    let mut wait_active = false; // M10 worker-wait state, the C wst's mirror
+    let mut wait_next: u64 = 0;
+    let mut wait_up = false;
+    let mut wait_cbor = false;
     let mut out = String::new();
 
     for line in input.lines() {
@@ -273,6 +278,85 @@ fn main() {
                 _ => "X parse\n".to_string(),
             };
             out.push_str(&build);
+            continue;
+        }
+
+        // worker-wait orchestration (M10): the Rust mirror of the table in
+        // asm/ctaphid_wait.S. "W start <is_cbor> <now_ms>" arms the cadence,
+        // "W up <0|1>" sets the worker's touch flag, "W tick <now_ms>" emits
+        // one "W ka <status>" per KEEPALIVE_MS deadline crossed (00 = the
+        // U2F fast-op silence — the keepalive_status() call is the shipping
+        // pub twin, live), "W frame <128hex> <n> <cid>" -> "W r 0|1|2",
+        // "W done" ends the wait. Provenance: the read-only-while-up_pending
+        // gating and the drop/queue split are body-sourced (shipping
+        // run_with_keepalive, ctaphid.rs:737-813); the chained
+        // next += KEEPALIVE_MS restart and the non-strict (now >= next) due
+        // boundary are mirror-defined. The tick catch-up cap matches the C
+        // harness's.
+        if let Some(rest) = l.strip_prefix("W ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            match parts.as_slice() {
+                ["start", w, now_s] if w.len() == 1 && (*w == "0" || *w == "1") => {
+                    match now_s.parse::<u64>() {
+                        Ok(n) => {
+                            wait_cbor = *w == "1";
+                            wait_active = true;
+                            wait_next = n + KEEPALIVE_MS;
+                        }
+                        _ => out.push_str("X parse\n"),
+                    }
+                    continue;
+                }
+                ["up", w] if w.len() == 1 && (*w == "0" || *w == "1") => {
+                    wait_up = *w == "1";
+                    continue;
+                }
+                ["tick", now_s] => match now_s.parse::<u64>() {
+                    Ok(n) => {
+                        for _ in 0..65536 {
+                            if !wait_active || n < wait_next {
+                                break;
+                            }
+                            let s = keepalive_status(wait_cbor, wait_up);
+                            out.push_str(&format!(
+                                "W ka {:02x}\n",
+                                s.unwrap_or(0)
+                            ));
+                            wait_next += KEEPALIVE_MS;
+                        }
+                    }
+                    _ => out.push_str("X parse\n"),
+                },
+                ["frame", hex, n_s, cid_s]
+                    if hex.len() == 128 && cid_s.len() == 8 =>
+                {
+                    let frame = parse_hex(hex);
+                    let n = n_s.parse::<u32>().ok().filter(|v| *v <= 64);
+                    let cid = u32::from_str_radix(cid_s, 16).ok();
+                    let r = match (frame, n, cid) {
+                        (Some(f), Some(n), Some(c)) if f.len() == 64 => {
+                            let mut arr = [0u8; 64];
+                            arr.copy_from_slice(&f);
+                            if !wait_up {
+                                0 // queued: off the touch wait, unread
+                            } else if is_cancel_frame(&arr, n as usize, c) {
+                                2 // cancel: signal the worker's touch wait
+                            } else {
+                                1 // dropped: read mid-wait, not this cancel
+                            }
+                        }
+                        _ => {
+                            out.push_str("X parse\n");
+                            continue;
+                        }
+                    };
+                    out.push_str(&format!("W r {}\n", r));
+                }
+                ["done"] => {
+                    wait_active = false;
+                }
+                _ => out.push_str("X parse\n"),
+            }
             continue;
         }
 

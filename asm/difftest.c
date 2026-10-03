@@ -35,6 +35,15 @@ struct lock_state {
     unsigned until_hi;
 };
 
+/* mirror of asm/ctaphid_wait.S's caller-owned worker-wait state: whether a
+ * request is in flight plus the next KEEPALIVE deadline as a u64 split into
+ * two words, zero-init */
+struct wait_state {
+    unsigned active;
+    unsigned next_lo;
+    unsigned next_hi;
+};
+
 #define MSG_CAP 7609 /* CTAP_MAX_MESSAGE: 57 + 128*59 */
 
 extern void ctaphid_feed(struct state *st, const unsigned char *rpt);
@@ -49,6 +58,11 @@ extern unsigned ctaphid_lock_command(const unsigned char *body, unsigned len);
 extern unsigned ctaphid_wink(unsigned can_wink);
 extern unsigned ctaphid_msg_guard(unsigned cmd, unsigned len);
 extern unsigned ctaphid_unknown(unsigned cmd);
+extern void ctaphid_wait_start(struct wait_state *st, unsigned now_lo, unsigned now_hi);
+extern unsigned ctaphid_wait_tick(struct wait_state *st, unsigned now_lo, unsigned now_hi);
+extern unsigned ctaphid_wait_frame(unsigned up_pending, const unsigned char *frame,
+                                   unsigned n, unsigned cid);
+extern void ctaphid_wait_finish(struct wait_state *st);
 extern long sys_read(long fd, void *buf, long n);
 extern long sys_write(long fd, const void *buf, long n);
 
@@ -56,12 +70,14 @@ static struct state st;
 static struct tx_state txs;
 static struct init_state inis;
 static struct lock_state lks;
+static struct wait_state wst;
 static unsigned char msgbuf[MSG_CAP];
 static unsigned char paybuf[MSG_CAP];
 static unsigned char tframe[64];
 static unsigned char qbody[MSG_CAP]; /* body slots for the Q dispatch line */
 static unsigned char codebuf[1];
 static unsigned long long cur_now;    /* clock for Q lock guards (last L line) */
+static unsigned wait_up, wait_cbor;   /* the worker's touch flag; the applet in flight */
 
 /* any real line fits with two orders of magnitude to spare: the longest is
  * a maximum-size T payload at ~15.3 KB */
@@ -507,6 +523,81 @@ static void process_line(unsigned char *p, unsigned char *eol)
                 n++;
             }
         }
+        return;
+    }
+
+    /* worker-wait orchestration (M10): "W start <is_cbor 0|1> <now_ms dec>"
+     * arms the cadence, "W up <0|1>" sets the worker's touch flag,
+     * "W tick <now_ms dec>" -> one "W ka <00|01|02>" per 100 ms deadline
+     * crossed (00 = the U2F fast-op silence, the M8 S-line encoding),
+     * "W frame <frame 128-hex> <n dec> <cid 8-hex>" -> "W r 0|1|2"
+     * (0 queued off the touch wait, 1 dropped mid-wait, 2 cancel signalled),
+     * "W done" ends the wait. The tick's catch-up loop is capped so a huge
+     * clock jump cannot hang either side; the cap matches the oracle's. */
+    if (*p == 'W' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        unsigned long long now;
+        if (nf == 3 && f[0].len == 5 && f[0].p[0] == 's' && f[0].p[1] == 't' &&
+            f[0].p[2] == 'a' && f[0].p[3] == 'r' && f[0].p[4] == 't') {
+            if (!(f[1].len == 1 && (f[1].p[0] == '0' || f[1].p[0] == '1') &&
+                  parse_dec_u64(f[2].p, f[2].len, &now))) {
+                parse_error();
+                return;
+            }
+            wait_cbor = (unsigned)(f[1].p[0] - '0');
+            ctaphid_wait_start(&wst, (unsigned)now, (unsigned)(now >> 32));
+            return; /* start emits nothing; the cadence persists */
+        }
+        if (nf == 2 && f[0].len == 2 && f[0].p[0] == 'u' && f[0].p[1] == 'p') {
+            if (!(f[1].len == 1 && (f[1].p[0] == '0' || f[1].p[0] == '1'))) {
+                parse_error();
+                return;
+            }
+            wait_up = (unsigned)(f[1].p[0] - '0');
+            return; /* the flag flip emits nothing; the next tick reads it */
+        }
+        if (nf == 2 && f[0].len == 4 && f[0].p[0] == 't' && f[0].p[1] == 'i' &&
+            f[0].p[2] == 'c' && f[0].p[3] == 'k') {
+            if (!parse_dec_u64(f[1].p, f[1].len, &now)) {
+                parse_error();
+                return;
+            }
+            for (unsigned i = 0; i < 65536; i++) {
+                if (!ctaphid_wait_tick(&wst, (unsigned)now, (unsigned)(now >> 32)))
+                    break;
+                unsigned s = ctaphid_keepalive_status(wait_cbor, wait_up);
+                unsigned char *o = out;
+                *o++ = 'W'; *o++ = ' '; *o++ = 'k'; *o++ = 'a'; *o++ = ' ';
+                o = hex2(o, s);
+                *o++ = '\n';
+                emit(out, o - out);
+            }
+            return;
+        }
+        if (nf == 4 && f[0].len == 5 && f[0].p[0] == 'f' && f[0].p[1] == 'r' &&
+            f[0].p[2] == 'a' && f[0].p[3] == 'm' && f[0].p[4] == 'e') {
+            unsigned char wframe[64];
+            unsigned n, cid;
+            if (!(f[1].len == 128 && parse_hex_n(f[1].p, f[1].len, wframe) &&
+                  parse_dec_u32_bounded(f[2].p, f[2].len, 64, &n) &&
+                  parse_hex_u32(f[3].p, f[3].len, &cid))) {
+                parse_error();
+                return;
+            }
+            unsigned r = ctaphid_wait_frame(wait_up, wframe, n, cid);
+            unsigned char *o = out;
+            *o++ = 'W'; *o++ = ' '; *o++ = 'r'; *o++ = ' ';
+            *o++ = (unsigned char)('0' + r); *o++ = '\n';
+            emit(out, o - out);
+            return;
+        }
+        if (nf == 1 && f[0].len == 4 && f[0].p[0] == 'd' && f[0].p[1] == 'o' &&
+            f[0].p[2] == 'n' && f[0].p[3] == 'e') {
+            ctaphid_wait_finish(&wst);
+            return; /* the response itself is a T line, the caller's */
+        }
+        parse_error();
         return;
     }
 

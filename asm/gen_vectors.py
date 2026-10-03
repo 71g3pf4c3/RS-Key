@@ -329,6 +329,92 @@ frames.append("Q 0 90")
 frames.append("# malformed: q extra trailing field X-parses")
 frames.append("Q 0 90 {:08x} aa 02".format(LOWN))
 
+# worker-wait orchestration (M10): "W start <is_cbor> <now_ms>" arms the
+# cadence, "W up <0|1>" sets the touch flag, "W tick <now_ms>" -> one
+# "W ka <status>" per 100ms deadline crossed (00 = the U2F fast-op silence),
+# "W frame <128hex> <n> <cid>" -> "W r 0|1|2" (0 queued off the touch wait,
+# 1 dropped mid-wait, 2 cancel signalled), "W done" ends the wait.
+# Provenance: the period is the pub KEEPALIVE_MS (ctaphid.rs:61); the
+# read-only-while-up_pending gating and the drop/queue split are body-sourced
+# (shipping run_with_keepalive, ctaphid.rs:737-813); the chained restart and
+# the non-strict due boundary are mirror-defined.
+WOWN = 0x0123ABCD  # the channel whose MSG/CBOR request is in flight
+
+
+def wcase(name):
+    frames.append("# wait: " + name)
+
+
+wcase("a tick before any start is never due")
+frames.append("W tick 100000")
+
+wcase("cbor wait: nothing before the first deadline, ka on the boundary")
+frames.append("W start 1 0")
+frames.append("W tick 99")
+frames.append("W tick 100")   # now == next: the deadline itself is due
+frames.append("W tick 100")   # next moved to 200: not due again
+frames.append("W tick 250")   # crosses 200 only
+
+wcase("a tick back in time is simply not due")
+frames.append("W tick 150")
+
+wcase("the touch flag flips the status between deadlines")
+frames.append("W up 1")
+frames.append("W tick 300")   # crosses 300 -> UPNEEDED
+frames.append("W up 0")
+frames.append("W tick 400")   # crosses 400 -> PROCESSING
+
+wcase("a big jump owes one ka per deadline crossed")
+frames.append("W done")
+frames.append("W start 1 0")
+frames.append("W tick 1000")  # deadlines 100..1000: ten keepalives
+
+wcase("u2f fast op stays silent; a touch wait does not")
+frames.append("W done")
+frames.append("W start 0 0")
+frames.append("W tick 100")   # keepalive_status(false,false) = None -> 00
+frames.append("W up 1")
+frames.append("W tick 200")   # keepalive_status(false,true) = UPNEEDED
+frames.append("W done")
+
+wcase("an inactive wait is never due")
+frames.append("W tick 5000")
+
+wcase("frames off the touch wait are queued, not observed")
+frames.append("W start 1 0")
+frames.append("W up 0")
+frames.append("W frame {} 64 {:08x}".format(cframe(WOWN, 0x91).hex(), WOWN))
+frames.append("W frame {} 64 {:08x}".format(cframe(0xDEAD, 0x81).hex(), 0xDEAD))
+
+wcase("frames on the touch wait: the channel's cancel signals, the rest drop")
+frames.append("W up 1")
+frames.append("W frame {} 64 {:08x}".format(cframe(WOWN, 0x91).hex(), WOWN))
+frames.append("W frame {} 64 {:08x}".format(cframe(0xBEEF, 0x91).hex(), 0xBEEF))
+frames.append("W frame {} 64 {:08x}".format(cframe(WOWN, 0x81).hex(), WOWN))
+frames.append("W frame {} 5 {:08x}".format(cframe(WOWN, 0x91).hex(), WOWN))
+frames.append("W frame {} 4 {:08x}".format(cframe(WOWN, 0x91).hex(), WOWN))
+frames.append("W done")
+
+# malformed W-lines: both sides must X-parse identically
+frames.append("# malformed: w unknown subop X-parses")
+frames.append("W zzz 1")
+frames.append("# malformed: w start is_cbor not 0/1 X-parses")
+frames.append("W start 2 0")
+frames.append("# malformed: w start missing the now field X-parses")
+frames.append("W start 1")
+frames.append("# malformed: w up not 0/1 X-parses")
+frames.append("W up 2")
+frames.append("# malformed: w tick non-decimal X-parses")
+frames.append("W tick zz")
+frames.append("# malformed: w frame short of 128 hex X-parses")
+frames.append("W frame {} 64 {:08x}".format(cframe(WOWN, 0x91).hex()[:-2], WOWN))
+frames.append("# malformed: w frame n out of range X-parses")
+frames.append("W frame {} 65 {:08x}".format(cframe(WOWN, 0x91).hex(), WOWN))
+frames.append("# malformed: w frame cid short of 8 hex X-parses")
+frames.append("W frame {} 64 1122".format(cframe(WOWN, 0x91).hex()))
+frames.append("# malformed: w done with a trailing field X-parses")
+frames.append("W done now")
+
 # malformed control lines: both sides must X-parse identically
 frames.append("# malformed: cancel n out of range (65) X-parses")
 frames.append("C {} 65 {:08x}".format(cframe(LOWN, 0x91).hex(), LOWN))

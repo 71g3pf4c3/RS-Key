@@ -19,10 +19,15 @@ ctrl:  transport-control lines — "K is_cbor up_pending" keepalive, "C frame
         with random lock times (0..10 s and occasionally past the dispatcher's
         LOCK_MAX_SECONDS clamp, which neither side may apply) and now_ms drift
         that crosses lock expiry.
-dispatch: dispatcher-verdict lines — "Q can_wink cmd cid body" over random
+dispatch:  dispatcher-verdict lines — "Q can_wink cmd cid body" over random
         commands/cids/bodies, with the passive lock pre-armed so a share of the
         routing commands land on a refused channel; the cannot-acknowledge
         CANCEL and the unknown-command rows are exercised too.
+wait:     worker-wait lines — "W start/up/tick/frame/done" with the clock
+        drifting across 100ms keepalive deadlines, the touch flag flipping, and
+        frames arriving on the waiting channel's and foreign cids (cancel
+        shaped and not), so the cadence chain and the queue/drop/cancel
+        disposition fuzz together.
 """
 
 import random
@@ -189,6 +194,39 @@ def dispatch_lines(rng, n):
     return out
 
 
+def wait_lines(rng, n):
+    """Random worker-wait W-lines. The clock drifts by 0..300 ms per tick so a
+    tick crosses at most a few keepalive deadlines (the catch-up burst stays
+    small), sometimes backwards; the touch flag flips; frames arrive cancel-
+    shaped or not on the waiting channel's and foreign cids at n around the
+    5-byte cancel threshold; starts and dones interleave."""
+    out = []
+    wcid = 0x0123ABCD
+    now = 0
+    for _ in range(n):
+        r = rng.random()
+        if r < 0.1:
+            out.append("W start {} {}".format(rng.choice([0, 1]), now))
+        elif r < 0.3:
+            out.append("W up {}".format(rng.choice([0, 1])))
+        elif r < 0.75:
+            now += rng.randrange(0, 300)
+            if rng.random() < 0.05:
+                now = rng.randrange(0, max(now, 1))  # a tick back in time
+            out.append("W tick {}".format(now))
+        elif r < 0.95:
+            cid = rng.choice([wcid, 0xAABBCCDD, 0xFFFFFFFF])
+            cmd = rng.choice([0x91, 0x91, 0x81, 0x86, 0x90])
+            ln = rng.choice([4, 5, 6, rng.randrange(0, 65)])
+            b = bytearray(64)
+            b[0:4] = struct.pack("<I", cid)
+            b[4] = cmd
+            out.append("W frame {} {} {:08x}".format(bytes(b).hex(), ln, cid))
+        else:
+            out.append("W done")
+    return out
+
+
 def main():
     seed = int(sys.argv[1])
     n = int(sys.argv[2])
@@ -209,6 +247,9 @@ def main():
         return
     if mode == "dispatch":
         print("\n".join(dispatch_lines(rng, n)))
+        return
+    if mode == "wait":
+        print("\n".join(wait_lines(rng, n)))
         return
     tx = None  # live valid transaction: (cid, payload, off, seq)
     for _ in range(n):
