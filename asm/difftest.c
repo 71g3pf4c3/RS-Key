@@ -63,6 +63,14 @@ extern unsigned ctaphid_wait_tick(struct wait_state *st, unsigned now_lo, unsign
 extern unsigned ctaphid_wait_frame(unsigned up_pending, const unsigned char *frame,
                                    unsigned n, unsigned cid);
 extern void ctaphid_wait_finish(struct wait_state *st);
+extern unsigned ccid_process(const unsigned char *msg, unsigned msg_len,
+                             const unsigned char *atr, unsigned atr_len,
+                             unsigned char *status, unsigned char *out,
+                             unsigned out_cap);
+extern unsigned ccid_xfr_apdu(const unsigned char *msg, unsigned len, unsigned *range);
+extern unsigned ccid_secure_apdu(const unsigned char *msg, unsigned len, unsigned *range);
+extern void ccid_put_header(unsigned char *out, unsigned msg_type, unsigned length,
+                            unsigned seq, unsigned status);
 extern long sys_read(long fd, void *buf, long n);
 extern long sys_write(long fd, const void *buf, long n);
 
@@ -78,6 +86,17 @@ static unsigned char qbody[MSG_CAP]; /* body slots for the Q dispatch line */
 static unsigned char codebuf[1];
 static unsigned long long cur_now;    /* clock for Q lock guards (last L line) */
 static unsigned wait_up, wait_cbor;   /* the worker's touch flag; the applet in flight */
+
+/* CCID (M13): the slot's bStatus and the ATR the card presents on power-on.
+ * The defaults are an unpowered slot (STATUS_INACTIVE) and ATR_RSKEY
+ * (ccid.rs:100), byte-pinned by the differential, not restated in a mirror. */
+static unsigned char ccid_status = 1;
+static unsigned char ccid_atr[256] = {
+    0x3b, 0xfc, 0x13, 0x00, 0x00, 0x81, 0x31, 0xfe, 0x15, 0x80, 0x73, 0xc0,
+    0x21, 0xc0, 0x56, 0x52, 0x53, 0x2d, 0x4b, 0x65, 0x79, 0x4b,
+};
+static unsigned ccid_atr_len = 22;
+static unsigned char ccid_out[2048]; /* MAX_CCID_MSG, the reply slice */
 
 /* any real line fits with two orders of magnitude to spare: the longest is
  * a maximum-size T payload at ~15.3 KB */
@@ -150,6 +169,19 @@ static unsigned char *hexn(unsigned char *p, const unsigned char *b, unsigned n)
         *p++ = d[b[i] >> 4];
         *p++ = d[b[i] & 0xf];
     }
+    return p;
+}
+
+/* bare decimal, no padding — the oracle's "{}" formatting */
+static unsigned char *decn(unsigned char *p, unsigned v)
+{
+    char tmp[10];
+    int n = 0;
+    do {
+        tmp[n++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v);
+    while (n) *p++ = (unsigned char)tmp[--n];
     return p;
 }
 
@@ -598,6 +630,111 @@ static void process_line(unsigned char *p, unsigned char *eol)
             return; /* the response itself is a T line, the caller's */
         }
         parse_error();
+        return;
+    }
+
+    /* CCID (M13): "A <hex>" selects the ATR the card presents (persists,
+     * emits nothing), "N <2-hex>" seeds the slot bStatus, "H <type 2-hex>
+     * <len dec> <seq 2-hex> <status 2-hex>" -> "H <20-hex>" pins the
+     * response header alone, "X|E <msg-hex>" -> "X|E 0" or "X|E 1 <start>
+     * <end>" ranges an XfrBlock/Secure payload, and "M <cap dec> <msg-hex>"
+     * runs one whole message -> "M <n> <resp-hex>" (n 0: no response).
+     * A cap in [10,17] is only fed to non-params/non-rate traffic: the Rust
+     * process_message slices out[10..17]/out[10..18] unguarded there and
+     * panics on its own bounds — a crash, not a divergence — so the
+     * generators keep that window to the messages that fit it. */
+    if (*p == 'A' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        if (nf != 1 || (f[0].len & 1) != 0 || f[0].len / 2 > sizeof ccid_atr ||
+            (f[0].len && !parse_hex_n(f[0].p, f[0].len, ccid_atr))) {
+            parse_error();
+            return;
+        }
+        ccid_atr_len = f[0].len / 2;
+        return; /* persists; the next M line reads it */
+    }
+
+    if (*p == 'N' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        unsigned char v;
+        if (nf != 1 || !parse_hex_byte(f[0].p, f[0].len, &v)) {
+            parse_error();
+            return;
+        }
+        ccid_status = v;
+        return;
+    }
+
+    if (*p == 'H' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        unsigned char type, seq, stt;
+        unsigned long long len;
+        if (nf != 4 || !parse_hex_byte(f[0].p, f[0].len, &type) ||
+            !parse_dec_u64(f[1].p, f[1].len, &len) || len > 0xffffffffull ||
+            !parse_hex_byte(f[2].p, f[2].len, &seq) ||
+            !parse_hex_byte(f[3].p, f[3].len, &stt)) {
+            parse_error();
+            return;
+        }
+        ccid_put_header(ccid_out, type, (unsigned)len, seq, stt);
+        unsigned char *o = out;
+        *o++ = 'H'; *o++ = ' ';
+        o = hexn(o, ccid_out, 10);
+        *o++ = '\n';
+        emit(out, o - out);
+        return;
+    }
+
+    if ((*p == 'X' || *p == 'E') && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        if (nf != 1 || (f[0].len & 1) != 0 || f[0].len / 2 > MSG_CAP ||
+            (f[0].len && !parse_hex_n(f[0].p, f[0].len, paybuf))) {
+            parse_error();
+            return;
+        }
+        unsigned range[2];
+        unsigned r = (*p == 'X') ? ccid_xfr_apdu(paybuf, f[0].len / 2, range)
+                                : ccid_secure_apdu(paybuf, f[0].len / 2, range);
+        unsigned char *o = out;
+        *o++ = *p; *o++ = ' ';
+        if (r) {
+            *o++ = '1'; *o++ = ' ';
+            o = decn(o, range[0]); *o++ = ' ';
+            o = decn(o, range[1]);
+        } else {
+            *o++ = '0';
+        }
+        *o++ = '\n';
+        emit(out, o - out);
+        return;
+    }
+
+    if (*p == 'M' && p + 1 < eol && *(p + 1) == ' ') {
+        struct field f[MAX_FIELDS];
+        unsigned nf = split_fields(p + 2, eol, f, MAX_FIELDS);
+        unsigned cap;
+        if (nf != 2 || !parse_dec_u32_bounded(f[0].p, f[0].len, 2048, &cap) ||
+            (f[1].len & 1) != 0 || f[1].len / 2 > MSG_CAP ||
+            (f[1].len && !parse_hex_n(f[1].p, f[1].len, paybuf))) {
+            parse_error();
+            return;
+        }
+        for (unsigned i = 0; i < cap; i++) ccid_out[i] = 0;
+        unsigned n = ccid_process(paybuf, f[1].len / 2, ccid_atr, ccid_atr_len,
+                                  &ccid_status, ccid_out, cap);
+        unsigned char *o = out;
+        *o++ = 'M'; *o++ = ' ';
+        o = decn(o, n);
+        if (n) {
+            *o++ = ' ';
+            o = hexn(o, ccid_out, n);
+        }
+        *o++ = '\n';
+        emit(out, o - out);
         return;
     }
 

@@ -433,4 +433,120 @@ frames.append("L bogus {:08x} 81 1000".format(LOWN))
 frames.append("# malformed: refuse cid short of 8 hex X-parses")
 frames.append("L refuse 1122 81 1000")
 
+# CCID (M13): rsk-usb's smart-card transport, run against the live
+# process_message/xfr_apdu/secure_apdu/put_header. The bulk-OUT header is
+# type, dwLength LE32, bSlot, bSeq, bStatus, bError, bChainParameter
+# (CCID 1.1 §6.1); every reply echoes bSeq and carries bSlot 0, bError 0.
+CCID_ATR_RSKEY = bytes.fromhex("3bfc1300008131fe158073c021c05652532d4b65794b")
+
+
+def cmsg(mtype, seq, dw=0, payload=b""):
+    b = bytearray(10)
+    b[0] = mtype
+    b[1:5] = struct.pack("<I", dw)
+    b[5] = 0
+    b[6] = seq
+    b += payload
+    return bytes(b)
+
+
+def ccase(name):
+    frames.append("# ccid: " + name)
+
+
+ccase("slot status echoes the live bStatus and bSeq")
+frames.append("N 01")
+frames.append("M 2048 " + cmsg(0x65, 0x07).hex())
+frames.append("N 00")
+frames.append("M 2048 " + cmsg(0x65, 0xFF).hex())
+
+ccase("power on returns the ATR and activates the slot")
+frames.append("N 01")
+frames.append("M 2048 " + cmsg(0x62, 0x01).hex())
+frames.append("M 2048 " + cmsg(0x62, 0x02).hex())
+frames.append("M 2048 " + cmsg(0x65, 0x03).hex())  # reads back ACTIVE
+frames.append("M 2048 " + cmsg(0x62, 0x04).hex())  # idempotent re-power
+
+ccase("power on: the ATR is clamped to the out cap")
+frames.append("M 0 " + cmsg(0x62, 3).hex())
+frames.append("M 10 " + cmsg(0x62, 4).hex())
+frames.append("M 20 " + cmsg(0x62, 5).hex())
+frames.append("M 32 " + cmsg(0x62, 6).hex())
+
+ccase("power off deactivates, whatever the status was")
+frames.append("M 2048 " + cmsg(0x63, 7).hex())
+frames.append("N 40")
+frames.append("M 2048 " + cmsg(0x63, 8).hex())
+
+ccase("get/set/reset params all answer the same T=1 block")
+for t in (0x61, 0x6C, 0x6D):
+    frames.append("M 2048 " + cmsg(t, 9).hex())
+
+ccase("set data rate returns eight zero bytes")
+frames.append("M 2048 " + cmsg(0x73, 10).hex())
+
+ccase("params and rate replies exactly at their cap")
+frames.append("M 17 " + cmsg(0x6C, 11).hex())
+frames.append("M 18 " + cmsg(0x73, 12).hex())
+
+ccase("worker-owned and unknown types earn no reply")
+for t in (0x6F, 0x69, 0x60, 0x6E, 0x70, 0x00, 0xFF):
+    frames.append("M 2048 " + cmsg(t, 13).hex())
+
+ccase("a message shorter than a header, or an out slice smaller than one")
+frames.append("M 2048 " + pat(9).hex())
+frames.append("M 9 " + cmsg(0x65, 14).hex())
+
+ccase("the ATR swap: power on presents the caller's bytes")
+frames.append("A " + bytes(range(0x20)).hex())
+frames.append("M 2048 " + cmsg(0x62, 15).hex())
+frames.append("A " + CCID_ATR_RSKEY.hex())
+
+ccase("xfr ranging: exact, clamped, zero, absent")
+frames.append("X " + cmsg(0x6F, 0, 5, pat(5)).hex())
+frames.append("X " + cmsg(0x6F, 0, 100, pat(10)).hex())
+frames.append("X " + cmsg(0x6F, 0, 0xFFFF_FFFF, pat(10)).hex())
+frames.append("X " + cmsg(0x6F, 0, 0).hex())
+frames.append("X " + cmsg(0x62, 0, 5, pat(5)).hex())
+frames.append("X " + pat(9).hex())
+
+ccase("secure ranging: the pinpad payload, and only on a Secure")
+frames.append("E " + cmsg(0x69, 0, 7, pat(7)).hex())
+frames.append("E " + cmsg(0x6F, 0, 7, pat(7)).hex())
+
+ccase("the header composes from its parts")
+frames.append("H 80 2048 7f 00")
+frames.append("H 82 0 00 01")
+frames.append("H 84 ffffffff 42 80")
+
+# malformed CCID lines: both sides must X-parse identically
+frames.append("# malformed: atr not hex X-parses")
+frames.append("A zz")
+frames.append("# malformed: atr odd-length X-parses")
+frames.append("A 3")
+frames.append("# malformed: atr missing entirely X-parses")
+frames.append("A")
+frames.append("# malformed: status short of 2 hex X-parses")
+frames.append("N 0")
+frames.append("# malformed: status not hex X-parses")
+frames.append("N zz")
+frames.append("# malformed: header missing fields X-parses")
+frames.append("H 80 5")
+frames.append("# malformed: header len not decimal X-parses")
+frames.append("H 80 x 00 00")
+frames.append("# malformed: header len past u32 X-parses")
+frames.append("H 80 10000000000 00 00")
+frames.append("# malformed: message missing the msg field X-parses")
+frames.append("M 100")
+frames.append("# malformed: message cap not decimal X-parses")
+frames.append("M zz 62")
+frames.append("# malformed: message cap past the out buffer X-parses")
+frames.append("M 2049 62")
+frames.append("# malformed: message odd-length hex X-parses")
+frames.append("M 2048 3")
+frames.append("# malformed: range not hex X-parses")
+frames.append("X zz")
+frames.append("# malformed: range odd-length X-parses")
+frames.append("E 3")
+
 print("\n".join(frames))

@@ -27,12 +27,13 @@ here. No file here is linked into a firmware binary.
 | `ctaphid_ctrl.S` | CTAPHID transport-control predicates: the keepalive 2×2, cancel-frame detection (with the `n ∈ [5,63]` threshold the shipping tests leave unpinned), and the per-channel lock (u64 strict-expiry arithmetic, owner-only release, broadcast-INIT carve-out) with the caller supplying `now_ms` — clock-free, like the firmware feeds it. |
 | `ctaphid_dispatch.S` | CTAPHID dispatcher verdicts (CTAP 2.1 §11.2.9): the pure leaves the transport consults per reassembled command — LOCK's length/`LOCK_MAX_SECONDS` clamp, WINK's capability gate, the empty-CBOR refusal, the unknown-command verdict. No framing of its own; the caller frames the error reply through `ctaphid_tx.S` and arms the lock through `ctaphid_ctrl.S`. |
 | `ctaphid_wait.S` | CTAPHID worker-wait state machine (CTAP 2.1 §11.2.9): what the transport does while the compute worker runs a reassembled MSG/CBOR. The keepalive cadence (a `KEEPALIVE_MS` deadline chain, clock supplied by the caller like the lock's `now_ms`) and the mid-flight frame disposition — queued off the touch wait, dropped or cancel-signalled on it. The cancel check reuses the M8 `ctaphid_is_cancel` twin. |
+| `ccid.S` | CCID message core (USB CCID 1.1): the smart-card transport's pure halves — `xfr_apdu`/`secure_apdu` payload ranging, the 10-byte response header, and `process_message`'s slot-state machine (power on/off with ATR presentation and cap clamp, slot status echo, the T=1 params block, the data-rate reply). XfrBlock/Secure earn no reply here either — they belong to the async worker in the shipping `Ccid::run`, exactly as MSG/CBOR do on the FIDO side. |
 | `difftest.S` | Linux user-mode entry for the differential harness: raw EABI syscalls, no libc. |
-| `difftest.c` | Differential harness driver: one 64-byte report per stdin line → `ctaphid_feed`, prints the event stream in the oracle's exact format; `T <cid> <cmd> <payload-hex>` lines drive `ctaphid_tx.S`, `I <can_wink> <nonce-hex>` lines drive `ctaphid_init.S`, `K`/`C`/`L` lines drive `ctaphid_ctrl.S`, `Q <can_wink> <cmd> <cid> <body-hex>` lines drive `ctaphid_dispatch.S` over the live lock state, and `W start/up/tick/frame/done` lines drive `ctaphid_wait.S` over the live cadence — the frame/predicate outputs share one stream. Streams input line-by-line so no input size is truncated. |
+| `difftest.c` | Differential harness driver: one 64-byte report per stdin line → `ctaphid_feed`, prints the event stream in the oracle's exact format; `T <cid> <cmd> <payload-hex>` lines drive `ctaphid_tx.S`, `I <can_wink> <nonce-hex>` lines drive `ctaphid_init.S`, `K`/`C`/`L` lines drive `ctaphid_ctrl.S`, `Q <can_wink> <cmd> <cid> <body-hex>` lines drive `ctaphid_dispatch.S` over the live lock state, `W start/up/tick/frame/done` lines drive `ctaphid_wait.S` over the live cadence, and `A`/`N`/`H`/`X`/`E`/`M` lines drive `ccid.S` (ATR select, slot-status seed, header composition, payload ranging, whole messages against a caller-sized out slice) — the frame/predicate outputs share one stream. Streams input line-by-line so no input size is truncated. |
 | `difftest.sh` | Builds the ARM side + Rust oracle, then requires byte-identical event streams over the spec vectors and seeded random frames. |
 | `gen_vectors.py` | Spec/reassembly vectors (CTAP 2.1 §11.2.9): single/multi-packet, gaps, cross-channel, broadcast, cap-overflow, maximum 7609-byte message; plus TX framing cases with boundary lengths. |
-| `gen_random.py` | Seeded random frames for the fuzz differential: `noise` (uniform garbage around the framing), `mixed` (valid transactions with noise interleaved on live state), `tx` (random response-framing and INIT-allocation lines), `ctrl` (random keepalive/cancel/lock lines, including expiry-crossing `now_ms` sequences), `dispatch` (random command/cid/body verdict lines over a live lock, so the channel-busy guard and its carve-outs fuzz) and `wait` (random cadence/touch-flag/frame sequences, so the deadline chain and the queue/drop/cancel disposition fuzz together). |
-| `oracle/` | Rust differential oracle over rsk-usb's `Reassembler` and `TxFrames` — the **shipping** implementations. A detached cargo workspace (the `tools/emu` pattern); links `rsk-usb` from `../../crates/rsk-usb` for host execution only. |
+| `gen_random.py` | Seeded random frames for the fuzz differential: `noise` (uniform garbage around the framing), `mixed` (valid transactions with noise interleaved on live state), `tx` (random response-framing and INIT-allocation lines), `ctrl` (random keepalive/cancel/lock lines, including expiry-crossing `now_ms` sequences), `dispatch` (random command/cid/body verdict lines over a live lock, so the channel-busy guard and its carve-outs fuzz), `wait` (random cadence/touch-flag/frame sequences, so the deadline chain and the queue/drop/cancel disposition fuzz together) and `ccid` (random ATR/status drift, header composition, XfrBlock/Secure ranging with dwLength at and past the bytes present, and whole messages against caps around every reply size). |
+| `oracle/` | Rust differential oracle over rsk-usb's `Reassembler`, `TxFrames` and `ccid` — the **shipping** implementations. A detached cargo workspace (the `tools/emu` pattern); links `rsk-usb` from `../../crates/rsk-usb` for host execution only. |
 | `usb.S` | USB device-side driver for the RP2350 USBCTRL block: chapter-9 EP0 control transfers (device/config/string/report descriptors) plus the EP1 interrupt endpoints that carry CTAPHID. Plain MMIO, one event per `usb_task`; register facts cite pico-sdk 2.2.0 headers. |
 | `usbtest.c` | Model-level USB harness: maps the USBCTRL register file + DPSRAM as plain memory under qemu-user and runs the driver against a datasheet-derived SIE model. Includes end-to-end exchanges: a CTAPHID echo through both EP1 endpoints, the INIT transaction (broadcast demand → allocation → reply field-checked: nonce echo, assigned cid, iface, versions, capabilities), and the full transport stack — dispatcher verdicts (LOCK arm/reply, WINK and empty-CBOR refusals, CHANNEL_BUSY on a locked channel) and the worker-wait cadence (PROCESSING/UPNEEDED keepalives out EP1, the touch-window CANCEL dispositions, the cancelled CBOR response) all framed through the TX kernel into EP1 IN. |
 | `usbtest.sh` | Builds `usb.S` + the SIE-model harness into a static ARM ELF and runs it under `qemu-arm`. |
@@ -68,7 +69,8 @@ QEMU=/nix/store/m4qamr94ba84viib1l2wskzwr90hbmmn-qemu-10.2.4/bin/qemu-arm \
 nix develop -c ./asm/difftest.sh [frames_per_seed]
 ```
 
-Default 700 frames/seed × 5 seeds × {noise, mixed, tx, ctrl}; spec vectors always run
+Default 700 frames/seed × 5 seeds × {noise, mixed, tx, ctrl, dispatch, wait,
+ccid}; spec vectors always run
 first. The oracle builds with an explicit host target triple (`HOST_TARGET`,
 defaulting to the current `rustc` host). Green means the ARM kernels and the
 shipping `rsk-usb` implementations emit **byte-identical** streams — a
@@ -131,6 +133,20 @@ Fails if a wrong-register poll would hang the driver (guarded by `timeout 60`).
   shipping tests leave them unpinned), and the worker-wait's
   read-only-while-up_pending frame gating (the shipping
   `run_with_keepalive` loop, ctaphid.rs:737-813).
+- **CCID message core — differentially tested.** `ccid.S` byte-identical to
+  the shipping `rsk-usb` `ccid.rs` over the spec vectors and the `ccid` fuzz
+  mode; unlike the dispatcher and worker-wait rows this is a full
+  differential — `process_message`, `xfr_apdu`, `secure_apdu` and
+  `put_header` are all `pub`, so the oracle links and calls the live
+  functions, no mirror at all. The one owned datum, the private `T1_PARAMS`
+  block, is pinned by the differential. Mutation-verified through the
+  differential row: the power-on ATR clamp and the persistent
+  `*status = ACTIVE` write, the range clamp, the sub-header message guard,
+  and a T=1 params byte. The Rust `process_message` slices `out[10..17]`/
+  `out[10..18]` unguarded on the params/rate replies — an out slice below
+  those floors panics the oracle rather than diverging, so the generators
+  keep sub-floor caps to the messages whose replies fit them (noted in
+  both generators).
 - **USB driver — verified against a MODEL.** The SIE model is derived from the
   datasheet, with write-to-clear behaviour and explicit host-driven EP1 OUT
   delivery. Green here means datasheet-model agreement only — real-silicon

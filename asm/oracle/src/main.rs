@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 RS-Key contributors
 
+use rsk_usb::ccid::{process_message, put_header, secure_apdu, xfr_apdu, ATR_RSKEY};
 use rsk_usb::ctaphid::{
     init_capabilities, is_cancel_frame, keepalive_status, ChannelLock, CidAllocator, Outcome,
     Reassembler, TxFrames, CTAPHID_CANCEL, CTAPHID_CBOR, CTAPHID_ERROR, CTAPHID_LOCK,
@@ -27,6 +28,14 @@ fn parse_hex(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+fn hex_str(b: &[u8]) -> String {
+    let mut s = String::with_capacity(2 * b.len());
+    for byte in b {
+        s.push_str(&format!("{:02x}", byte));
+    }
+    s
+}
+
 fn main() {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap();
@@ -38,9 +47,13 @@ fn main() {
     let mut wait_next: u64 = 0;
     let mut wait_up = false;
     let mut wait_cbor = false;
+    // CCID (M13): the slot bStatus (an unpowered slot reports STATUS_INACTIVE)
+    // and the ATR the card presents, both pinned against the C harness's
+    let mut ccid_status: u8 = 1;
+    let mut ccid_atr: Vec<u8> = ATR_RSKEY.to_vec();
     let mut out = String::new();
 
-    for line in input.lines() {
+    'lines: for line in input.lines() {
         let l = line.trim();
         if l.is_empty() || l.starts_with('#') {
             continue;
@@ -356,6 +369,115 @@ fn main() {
                     wait_active = false;
                 }
                 _ => out.push_str("X parse\n"),
+            }
+            continue;
+        }
+
+        // CCID (M13): the live rsk-usb functions — process_message, the two
+        // payload rangers and put_header — run against the asm twin. The
+        // state mirrors the C harness's: a slot bStatus and the ATR bytes
+        // the card presents, both starting at ATR_RSKEY/unpowered.
+        if let Some(rest) = l.strip_prefix("A ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            let atr = match parts.as_slice() {
+                [h] if h.len() % 2 == 0 && h.len() / 2 <= 256 => parse_hex(h),
+                _ => None,
+            };
+            match atr {
+                Some(b) => ccid_atr = b,
+                _ => out.push_str("X parse\n"),
+            }
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix("N ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            let v = match parts.as_slice() {
+                [h] if h.len() == 2 => u8::from_str_radix(h, 16).ok(),
+                _ => None,
+            };
+            match v {
+                Some(b) => ccid_status = b,
+                _ => out.push_str("X parse\n"),
+            }
+            continue;
+        }
+        if let Some(rest) = l.strip_prefix("H ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            let parsed = match parts.as_slice() {
+                // 2-hex type/seq/status, exactly — the C parser's widths
+                [t, len_s, sq, st]
+                    if t.len() == 2 && sq.len() == 2 && st.len() == 2 =>
+                {
+                    let len = len_s.parse::<u64>().ok().filter(|v| *v <= 0xffff_ffff);
+                    match (
+                        u8::from_str_radix(t, 16).ok(),
+                        len,
+                        u8::from_str_radix(sq, 16).ok(),
+                        u8::from_str_radix(st, 16).ok(),
+                    ) {
+                        (Some(t), Some(len), Some(sq), Some(st)) => Some((t, len, sq, st)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let mut hbuf = [0u8; 10];
+            match parsed {
+                Some((t, len, sq, st)) => {
+                    put_header(&mut hbuf, t, len as u32, sq, st);
+                    out.push_str(&format!("H {}\n", hex_str(&hbuf)));
+                }
+                _ => out.push_str("X parse\n"),
+            }
+            continue;
+        }
+        for tag in ["X", "E"] {
+            if let Some(rest) = l.strip_prefix(tag).filter(|r| r.starts_with(' ')) {
+                let rest = &rest[1..]; // past the separator the prefix kept
+                let parts: Vec<&str> = rest.split(' ').collect();
+                let msg = match parts.as_slice() {
+                    [h] if h.len() % 2 == 0 && h.len() / 2 <= TX_CAP => parse_hex(h),
+                    _ => None,
+                };
+                let msg = match msg {
+                    Some(m) => m,
+                    _ => {
+                        out.push_str("X parse\n");
+                        continue 'lines;
+                    }
+                };
+                let r = if *tag == *"X" { xfr_apdu(&msg) } else { secure_apdu(&msg) };
+                match r {
+                    Some((s, e)) => out.push_str(&format!("{} 1 {} {}\n", tag, s, e)),
+                    None => out.push_str(&format!("{} 0\n", tag)),
+                }
+                continue 'lines;
+            }
+        }
+        if let Some(rest) = l.strip_prefix("M ") {
+            let parts: Vec<&str> = rest.split(' ').collect();
+            let parsed = match parts.as_slice() {
+                [cap_s, h] if h.len() % 2 == 0 && h.len() / 2 <= TX_CAP => {
+                    match (cap_s.parse::<usize>().ok(), parse_hex(h)) {
+                        (Some(cap), msg) if cap <= 2048 => Some((cap, msg)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let (cap, msg) = match parsed {
+                Some((cap, Some(msg))) => (cap, msg),
+                _ => {
+                    out.push_str("X parse\n");
+                    continue;
+                }
+            };
+            let mut obuf = vec![0u8; cap];
+            let n = process_message(&msg, &ccid_atr, &mut ccid_status, &mut obuf);
+            if n > 0 {
+                out.push_str(&format!("M {} {}\n", n, hex_str(&obuf[..n])));
+            } else {
+                out.push_str("M 0\n");
             }
             continue;
         }

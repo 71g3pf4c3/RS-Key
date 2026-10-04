@@ -28,6 +28,12 @@ wait:     worker-wait lines — "W start/up/tick/frame/done" with the clock
         frames arriving on the waiting channel's and foreign cids (cancel
         shaped and not), so the cadence chain and the queue/drop/cancel
         disposition fuzz together.
+ccid:    smart-card transport lines — "A/N" ATR and slot-status seeding, "H"
+        header composition, "X/E" XfrBlock/Secure payload ranging, and "M"
+        whole messages against caps around the reply-size boundaries. A cap
+        in [10,17] is only paired with replies that fit it: the Rust oracle
+        would panic slicing its own out buffer there (a crash, not a
+        divergence the differential should chase).
 """
 
 import random
@@ -159,6 +165,70 @@ DISPATCH_CMDS = [0x81, 0x83, 0x87, 0x90, 0x84, 0x88, 0x91, 0x9F, 0x80, 0xC0, 0x3
 DISPATCH_OWNER = 0x11223344
 DISPATCH_STRANGER = 0xAABBCCDD
 
+# the bulk-OUT vocabulary the message core answers (CCID 1.1 §6.1-1);
+# XfrBlock/Secure are worker-owned and only ever range-checked
+CCID_TYPES = [0x61, 0x62, 0x63, 0x65, 0x6C, 0x6D, 0x6F, 0x69, 0x73, 0x00]
+# caps that answer any message (below HEADER, or with room to spare) vs the
+# reply floors: params writes out[10..17], set-rate out[10..18], and the
+# Rust oracle would panic slicing its own buffer below those
+CCID_SMALL_CAPS = [0, 5, 9]
+CCID_PARAMS_CAPS = [17, 18, 19, 20, 32, 64, 2048]
+CCID_RATE_CAPS = [18, 19, 20, 32, 64, 2048]
+CCID_TIGHT_CAPS = [10, 11, 15, 16, 17]  # only with replies that fit them
+
+
+def ccid_msg(rng, mtype, dw, payload_len):
+    b = bytearray(10)
+    b[0] = mtype
+    b[1:5] = struct.pack("<I", dw)
+    b[5] = rng.randrange(256)  # bSlot (ignored)
+    b[6] = rng.randrange(256)  # bSeq, echoed in the reply
+    b += pat(rng, payload_len)
+    return bytes(b)
+
+
+def ccid_lines(rng, n):
+    """Random CCID lines: the ATR and slot status drift, headers compose, the
+    payload rangers see dwLength at and past the bytes actually present, and
+    whole messages land against caps around the reply sizes."""
+    out = []
+    for _ in range(n):
+        r = rng.random()
+        if r < 0.05:
+            ln = rng.choice([0, 1, 22, 23, 64, rng.randrange(0, 65)])
+            out.append("A " + pat(rng, ln).hex())
+        elif r < 0.10:
+            out.append("N {:02x}".format(rng.choice([0, 1, 0x40, 0x80,
+                                                     rng.randrange(256)])))
+        elif r < 0.20:
+            ln = rng.choice([0, 1, 7, 8, 0xFFFF, 0x10000,
+                             rng.randrange(0, 0x1_0000_0000)])
+            out.append("H {:02x} {} {:02x} {:02x}".format(
+                rng.choice(CCID_TYPES + [rng.randrange(256)]), ln,
+                rng.randrange(256), rng.randrange(256)))
+        elif r < 0.40:
+            mtype = rng.choice(CCID_TYPES + [rng.randrange(256)])
+            plen = rng.choice([0, 9, 10, 11, rng.randrange(0, 200)])
+            dw = rng.choice([0, 1, plen, plen + 1, max(plen - 1, 0),
+                             rng.randrange(0, 0x1_0000_0000), 0xFFFF_FFFF])
+            msg = ccid_msg(rng, mtype, dw, plen)
+            out.append("{} {}".format(rng.choice("XE"), msg.hex()))
+        else:
+            mtype = rng.choice(CCID_TYPES + [rng.randrange(256)])
+            plen = rng.choice([0, 9, 10, 11, 12, 17, 22, rng.randrange(0, 200)])
+            msg = ccid_msg(rng, mtype, rng.choice([0, plen, rng.randrange(0, 100)]), plen)
+            if mtype in (0x61, 0x6C, 0x6D):
+                cap = rng.choice(CCID_SMALL_CAPS + CCID_PARAMS_CAPS
+                                 + [rng.randrange(17, 2049)])
+            elif mtype == 0x73:
+                cap = rng.choice(CCID_SMALL_CAPS + CCID_RATE_CAPS
+                                 + [rng.randrange(18, 2049)])
+            else:
+                cap = rng.choice(CCID_SMALL_CAPS + CCID_PARAMS_CAPS
+                                 + CCID_TIGHT_CAPS + [rng.randrange(0, 2049)])
+            out.append("M {} {}".format(cap, msg.hex()))
+    return out
+
 
 def dispatch_lines(rng, n):
     """Random dispatcher Q-lines. A passive lock is armed up front and other
@@ -250,6 +320,9 @@ def main():
         return
     if mode == "wait":
         print("\n".join(wait_lines(rng, n)))
+        return
+    if mode == "ccid":
+        print("\n".join(ccid_lines(rng, n)))
         return
     tx = None  # live valid transaction: (cid, payload, off, seq)
     for _ in range(n):
